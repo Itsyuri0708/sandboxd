@@ -227,6 +227,26 @@ func (h *Handler) serve(r *http.Request, w http.ResponseWriter, id, port string,
 		return
 	}
 
+	// 1b. A row can say running while its container is gone (removed by
+	// hand, pruned) or has exited (OOM kill, crash). Traefik has already
+	// dropped the route, so the request lands here — answering "already
+	// running" would refresh the browser back into this page forever.
+	// Treat the row as stopped and take the normal start path below
+	// (2b recreates a missing container). The boot reconciler makes the
+	// same check, but only once at startup.
+	if sb.Status == "running" && h.containerGone(ctx, id, log) {
+		if err := h.Store.MarkStopped(ctx, id); err != nil {
+			wf.err = err
+			log.Warn("wake: MarkStopped on a running row with no container failed", "err", err.Error())
+			h.respondError(w, id, "internal_error", isHTML)
+			metrics.Wakes.WithLabelValues("error").Inc()
+			return
+		}
+		// sb.ContainerIP is left as-is so step 4b drops the old IP's
+		// egress rule once the container has its new one.
+		sb.Status = "stopped"
+	}
+
 	switch sb.Status {
 	case "running":
 		// Traefik may not have observed the route yet (catch-all
@@ -449,7 +469,28 @@ func (h *Handler) serve(r *http.Request, w http.ResponseWriter, id, port string,
 	h.respondSuccess(w, id, dur, isHTML)
 }
 
-// gatePrivateWake runs the /forward-auth preview-token check against
+// containerGone reports whether a sandbox whose row says running has no
+// live container behind it: missing, or present but not running. Any
+// other inspect error trusts the row, so a docker CLI hiccup can't
+// bounce a healthy sandbox.
+func (h *Handler) containerGone(ctx context.Context, id string, log *slog.Logger) bool {
+	cj, err := h.Docker.Inspect(ctx, "s-"+id)
+	switch {
+	case errors.Is(err, docker.ErrNotFound):
+		log.Warn("wake: row says running but the container is missing — treating as stopped")
+		return true
+	case err != nil:
+		log.Warn("wake: inspect of a running row failed (trusting the row)", "err", err.Error())
+		return false
+	case !cj.State.Running:
+		log.Warn("wake: row says running but the container is not — treating as stopped",
+			"docker_state", cj.State.Status)
+		return true
+	}
+	return false
+}
+
+// gatePrivateWakeruns the /forward-auth preview-token check against
 // the request cookie for a stopped private sandbox. It returns true
 // (and has already written a 302 / 401 response) when the wake must
 // be refused; false when the caller may proceed. Fails OPEN when Auth
