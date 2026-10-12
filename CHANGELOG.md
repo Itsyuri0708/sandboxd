@@ -6,6 +6,26 @@ All notable changes to sandboxd are documented here. The format is based on
 patch** — each lands the meaningful changes merged since the last one — and a
 **minor bump marks a milestone** release).
 
+## [0.3.22] — 2026-10-12
+
+### Fixed
+
+- Fix the control-plane build by keeping telemetry's instance and cloud organization
+  identifiers in scope. [#123](https://github.com/tastyeffectco/sandboxd/pull/123)
+- Recover previews when the database reports a running sandbox but its Docker
+  container is missing or exited. The wake handler now checks the container state
+  and enters the existing recovery path instead of repeatedly reporting it as
+  already running. Includes regression tests for missing, exited, healthy, and
+  inspect-error cases. [#121](https://github.com/tastyeffectco/sandboxd/pull/121)
+
+### Contributors
+
+Thanks to @gowchin for both fixes and their first contributions to sandboxd.
+
+No new configuration or breaking API changes are introduced by this patch.
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.21...v0.3.22
+
 ## [0.3.21] — 2026-09-20
 **Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.20...v0.3.21
 
