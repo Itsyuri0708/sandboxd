@@ -471,13 +471,6 @@ func main() {
 			log.Error("gvisor: write resolv.conf failed; sandbox DNS may not resolve", "err", err.Error())
 			dnsResolvConf = ""
 		} else {
-			cloudOrg := strings.TrimSpace(os.Getenv("SANDBOXD_CLOUD_ORG"))
-			if cloudOrg != "" {
-				// Cloud subscribers explicitly opt into linked product analytics in
-				// the Cloud installer. This joins acquisition, billing and safe usage
-				// buckets without sending app names, prompts, code, or file paths.
-				instanceID = "cloud:" + cloudOrg
-			}
 			log.Info("gvisor runtime enabled", "runtime", sbxRuntime, "dns", ns)
 		}
 		// gVisor sandboxes use public DNS (above) and can't reach Docker's
@@ -662,6 +655,13 @@ func main() {
 			log.Warn("telemetry: could not establish instance id — telemetry disabled", "err", idErr.Error())
 		} else {
 			log.Info("telemetry: anonymous version + daily heartbeat enabled (no code/PII); disable with SANDBOXD_TELEMETRY=off")
+			cloudOrg := strings.TrimSpace(os.Getenv("SANDBOXD_CLOUD_ORG"))
+			if cloudOrg != "" {
+				// Cloud subscribers explicitly opt into linked product analytics in
+				// the Cloud installer. This joins acquisition, billing and safe usage
+				// buckets without sending app names, prompts, code, or file paths.
+				instanceID = "cloud:" + cloudOrg
+			}
 			reporter := &telemetry.Reporter{
 				InstanceID: instanceID,
 				Version:    version,
