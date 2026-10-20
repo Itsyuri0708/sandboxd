@@ -36,29 +36,41 @@ type v1Settings struct {
 	Version   string `json:"version"`
 	GitCommit string `json:"git_commit,omitempty"`
 	// Update info from the release checker (best-effort). update_available is
-	// always present; latest_version/changelog_url are omitted until a release
-	// has been fetched.
-	UpdateAvailable bool              `json:"update_available"`
-	LatestVersion   string            `json:"latest_version,omitempty"`
-	ChangelogURL    string            `json:"changelog_url,omitempty"`
-	Networking      v1SettingsNet     `json:"networking"`
-	Auth            v1SettingsAuth    `json:"auth"`
-	Runtime         v1SettingsRuntime `json:"runtime"`
-	Lifecycle       v1SettingsLife    `json:"lifecycle"`
-	Egress          v1SettingsEgress  `json:"egress"`
-	Agents          v1SettingsAgents  `json:"agents"`
-	Presets         []v1Preset        `json:"presets"`
-	Capabilities    map[string]bool   `json:"capabilities"`
+	// always present; the latest_* fields are omitted until a release has been
+	// fetched. update_kind is "release" (an older tagged build) or "untagged"
+	// (a build with no comparable version) when an update is reported.
+	UpdateAvailable   bool              `json:"update_available"`
+	UpdateKind        string            `json:"update_kind,omitempty"`
+	LatestVersion     string            `json:"latest_version,omitempty"`
+	ChangelogURL      string            `json:"changelog_url,omitempty"`
+	LatestNotes       string            `json:"latest_notes,omitempty"`
+	LatestBreaking    string            `json:"latest_breaking,omitempty"`
+	LatestPublishedAt string            `json:"latest_published_at,omitempty"`
+	Networking        v1SettingsNet     `json:"networking"`
+	Auth              v1SettingsAuth    `json:"auth"`
+	Runtime           v1SettingsRuntime `json:"runtime"`
+	Lifecycle         v1SettingsLife    `json:"lifecycle"`
+	Egress            v1SettingsEgress  `json:"egress"`
+	Agents            v1SettingsAgents  `json:"agents"`
+	Presets           []v1Preset        `json:"presets"`
+	Capabilities      map[string]bool   `json:"capabilities"`
 	// Editable lists the field paths a client may change via PATCH /v1/settings.
 	// Everything else is read-only (env/file-managed or restart-required).
 	Editable []string `json:"editable"`
 }
 
 type v1SettingsNet struct {
-	PreviewDomain     string `json:"preview_domain"`
-	PublicHTTPPort    string `json:"public_http_port,omitempty"`
+	PreviewDomain  string `json:"preview_domain"`
+	PublicHTTPPort string `json:"public_http_port,omitempty"`
+	// PreviewBase is scheme://<pattern>[:port] covering every preview host.
+	// Nested: a real DNS wildcard (*.preview.<domain>). Flat: previews share
+	// their parent with the console and API, so the pattern is written as
+	// s-*-*[--tag].<domain>, mirroring the preview host shape.
 	PreviewBase       string `json:"preview_base"`
+	PreviewHostStyle  string `json:"preview_host_style"`
+	PreviewHostTag    string `json:"preview_host_tag,omitempty"`
 	PreviewTLS        bool   `json:"preview_tls"`
+	PreviewURLScheme  string `json:"preview_url_scheme"`
 	PreviewEntrypoint string `json:"preview_entrypoint,omitempty"`
 }
 type v1SettingsAuth struct {
@@ -110,9 +122,12 @@ func (s *Server) v1GetSettings(w http.ResponseWriter, _ *http.Request) {
 		GitCommit: s.Instance.GitCommit,
 		Networking: v1SettingsNet{
 			PreviewDomain:     s.PreviewDomain,
+			PreviewHostStyle:  s.hosts().Style,
+			PreviewHostTag:    s.hosts().Tag,
 			PublicHTTPPort:    s.PublicHTTPPort,
 			PreviewBase:       s.previewBase(),
 			PreviewTLS:        s.PreviewTLS,
+			PreviewURLScheme:  func() string { sc, _ := s.previewScheme(); return sc }(),
 			PreviewEntrypoint: s.PreviewEntrypoint,
 		},
 		Auth:      v1SettingsAuth{Enabled: s.Instance.AuthEnabled},
@@ -137,7 +152,10 @@ func (s *Server) v1GetSettings(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	if s.Update != nil {
-		out.UpdateAvailable, out.LatestVersion, out.ChangelogURL = s.Update.UpdateAvailable(s.Instance.Version)
+		u := s.Update.Status(s.Instance.Version)
+		out.UpdateAvailable, out.UpdateKind = u.Available, u.Kind
+		out.LatestVersion, out.ChangelogURL = u.Latest, u.ChangelogURL
+		out.LatestNotes, out.LatestBreaking, out.LatestPublishedAt = u.Notes, u.Breaking, u.PublishedAt
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -297,11 +315,11 @@ func (s *Server) agentDefaultModels() map[string]string {
 // previewBase is the scheme://host[:port] previews are reached under, with the
 // host-facing port appended unless it's the scheme default (mirrors previewURL).
 func (s *Server) previewBase() string {
-	scheme, defaultPort := "http", "80"
-	if s.PreviewTLS {
-		scheme, defaultPort = "https", "443"
+	scheme, defaultPort := s.previewScheme()
+	if s.PreviewURLScheme != "" {
+		defaultPort = s.PublicHTTPPort // the terminator in front owns the public port
 	}
-	host := "*.preview." + s.PreviewDomain
+	host := s.hosts().Wildcard()
 	if p := s.PublicHTTPPort; p != "" && p != defaultPort {
 		host += ":" + p
 	}

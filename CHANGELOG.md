@@ -2,8 +2,149 @@
 
 All notable changes to sandboxd are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
-[Semantic Versioning](https://semver.org/) (pre-1.0: a minor bump adds features,
-a patch is fixes only).
+[Semantic Versioning](https://semver.org/) (pre-1.0: **rolling releases bump the
+patch** — each lands the meaningful changes merged since the last one — and a
+**minor bump marks a milestone** release).
+
+## [Unreleased]
+
+### Added
+
+- Offer MiniMax M3.1 Flash before M3 in the OpenCode model picker and route it
+  through the direct MiniMax proxy. Preserve saved defaults and explicit legacy
+  model requests; M2.7 is no longer offered in the ordinary picker.
+
+## [0.3.22] — 2026-10-12
+
+### Fixed
+
+- Fix the control-plane build by keeping telemetry's instance and cloud organization
+  identifiers in scope. [#123](https://github.com/tastyeffectco/sandboxd/pull/123)
+- Recover previews when the database reports a running sandbox but its Docker
+  container is missing or exited. The wake handler now checks the container state
+  and enters the existing recovery path instead of repeatedly reporting it as
+  already running. Includes regression tests for missing, exited, healthy, and
+  inspect-error cases. [#121](https://github.com/tastyeffectco/sandboxd/pull/121)
+
+### Contributors
+
+Thanks to @gowchin for both fixes and their first contributions to sandboxd.
+
+No new configuration or breaking API changes are introduced by this patch.
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.21...v0.3.22
+
+## [0.3.21] — 2026-09-20
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.20...v0.3.21
+
+## [0.3.20] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.19...v0.3.20
+
+## [0.3.19] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.18...v0.3.19
+
+## [0.3.18] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.17...v0.3.18
+
+## [0.3.17] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.16...v0.3.17
+
+## [0.3.16] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.15...v0.3.16
+
+## [0.3.15] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.14...v0.3.15
+
+## [0.3.14] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.13...v0.3.14
+
+## [0.3.13] — 2026-08-28
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.12...v0.3.13
+
+## [0.3.12] — 2026-08-25
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.11...v0.3.12
+
+## [0.3.11] — 2026-08-25
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.10...v0.3.11
+
+## [0.3.10] — 2026-08-25
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.9...v0.3.10
+
+## [0.3.9] — 2026-08-25
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.8...v0.3.9
+
+## [0.3.8] — 2026-08-25
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.7...v0.3.8
+
+## [0.3.7] — 2026-08-25
+
+* Fix broken Star History chart in README by @FaintFlower in https://github.com/tastyeffectco/sandboxd/pull/103
+
+### New Contributors
+* @FaintFlower made their first contribution in https://github.com/tastyeffectco/sandboxd/pull/103
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.6...v0.3.7
+
+## [0.3.6] — 2026-08-01
+
+* fix(console): stop double-prefixing write paths (console saves went to a phantom dir) by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/99
+* feat(detect): detect the project's package manager (yarn/npm/bun), not just pnpm by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/100
+
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.5...v0.3.6
+
+## [0.3.5] — 2026-07-30
+
+* fix: self-healing start — recreate sandboxes whose container is stale or missing by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/97
+* fix(authproxy): fail fast with the provider's real message instead of a timeout by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/98
+
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.4...v0.3.5
+
+## [0.3.4] — 2026-07-30
+
+* feat(brain): spoke notes (brain/*.md) + shared-concept radar by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/96
+
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.3...v0.3.4
+
+## [0.3.3] — 2026-07-30
+
+* feat(brain): [[wikilinks]] between brains + knowledge graph view by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/95
+
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.2...v0.3.3
+
+## [0.3.2] — 2026-07-30
+
+* feat: Project Brain — persistent per-app memory (BRAIN.md) by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/94
+
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.1...v0.3.2
+
+## [0.3.1] — 2026-07-30
+
+* docs: remove dev-process/phase artifacts; make md match the code by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/76
+* install: BSD-safe mktemp on macOS by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/74
+* docs(git): document token rotation (delete + recreate) by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/72
+* Opt-in gVisor (runsc) isolation for sandboxes — verified end-to-end by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/69
+* fix(console): terminal WebSocket died with 400 through the console nginx by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/77
+* fix(console): terminal origin check failed on non-default ports ($host strips the port) by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/78
+* console: terminal connects on explicit click (not on tab open) by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/79
+* readme: CTAs for release news + Cloud waitlist by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/80
+* console(demo): make visitors notice the live preview is a real running app by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/81
+* readme: affiliate disclosure above the deploy links by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/83
+* console(home): explainer + live overview stats on the Apps home by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/82
+* readme: compact 2-column screenshot grid by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/85
+* feat(agent-auth): add direct MiniMax credentials and upstreams by @octo-patch in https://github.com/tastyeffectco/sandboxd/pull/89
+* upgrade: rebuild the sandbox base image when runtimed changes by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/90
+* console: update-available notification (+ checker false-positive fix) by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/91
+* release tooling: ./release.sh (rolling patch releases + generated changelog) by @tastyeffectco in https://github.com/tastyeffectco/sandboxd/pull/92
+
+### New Contributors
+* @octo-patch made their first contribution in https://github.com/tastyeffectco/sandboxd/pull/89
+
+**Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.0...v0.3.1
 
 ## [0.3.0] — 2026-07-07
 

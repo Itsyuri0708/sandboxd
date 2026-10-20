@@ -58,7 +58,7 @@ credentials never live here — they're held control-plane side (see
 | Boundary | Survives? | Notes |
 |---|---|---|
 | Container restart / stop→wake | ✅ Everything in `/home/sandbox` | The container rootfs is `--read-only` and tmpfs `/tmp` / `/var/tmp` evaporate, but the workspace mount at `/home/sandbox` is untouched. |
-| Container destroy + recreate, same id | ✅ Everything | The workspace lives on host disk under `/var/lib/sandboxed/workspaces/<id>/`; the destroy path preserves it. |
+| Container destroy + recreate, same id | ✅ Everything | The workspace lives on host disk under `/var/lib/sandboxd/workspaces/<id>/`; the destroy path preserves it. |
 | Container destroy + new id | ❌ Nothing | A new id means a new workspace. There is no copy-from-id primitive — use a **snapshot / fork** to carry a workspace forward. |
 | Host reboot | ✅ Everything | Workspaces are on the data-dir partition. On boot the reconciler converges running rows back to containers. |
 | Base-image upgrade | ✅ Everything | The home is a bind mount; rebuilding the image never touches it. Skel changes only affect *new* workspaces (seeding happens once, at creation). |
@@ -107,6 +107,7 @@ interactive shells, non-interactive `docker exec`, the entrypoint chain, daemons
 | `PIP_INDEX_URL` | `https://pypi.org/simple/` | pip + uv (uv reads pip's env block) |
 | `PATH` | `…:/home/sandbox/.local/bin:/home/sandbox/.bun/bin` | every binary is on PATH without a shell-init step |
 | `LANG`, `DEBIAN_FRONTEND` | C.UTF-8 / noninteractive | base locale + apt hygiene |
+| `BROWSER` | `none` | a sandbox has no browser; dev servers that auto-open one (`vite --open` and friends) otherwise crash on the missing `xdg-open` |
 
 **Rule of thumb**: if a setting MUST work for a bare `docker exec s-id pnpm install`
 (no `bash -l`), it belongs in the Dockerfile `ENV`. Operators who run a caching
