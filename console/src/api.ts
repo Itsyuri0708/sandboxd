@@ -27,10 +27,24 @@ export interface Preset {
 export interface Settings {
   version: string
   git_commit?: string
+  // Release-checker result (best-effort; cached server-side). update_kind is
+  // "release" for an older tagged build and "untagged" for a build with no
+  // comparable version (dev / bare commit / describe form); both see updates.
+  // latest_notes is the release body (markdown); latest_breaking is its
+  // "Breaking changes" section, absent when the release has none.
+  update_available: boolean
+  update_kind?: 'release' | 'untagged'
+  latest_version?: string
+  changelog_url?: string
+  latest_notes?: string
+  latest_breaking?: string
+  latest_published_at?: string
   networking: {
     preview_domain: string
     public_http_port?: string
     preview_base: string
+    preview_host_style: 'nested' | 'flat'
+    preview_host_tag?: string
     preview_tls: boolean
     preview_entrypoint?: string
   }
@@ -203,6 +217,7 @@ export interface ApiKey {
   prefix: string
   created_at: string
   last_used_at: string | null
+  scopes?: string[] // empty = full access
 }
 
 export interface Preview {
@@ -304,7 +319,19 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   return (ct.includes('application/json') ? res.json() : (res.text() as unknown)) as Promise<T>
 }
 
+export type UpgradeState = {
+  phase: 'idle' | 'running' | 'succeeded' | 'failed' | 'rolled_back' | 'unavailable'
+  target?: string
+  from?: string
+  started_at?: string
+  ended_at?: string
+  message?: string
+  log_tail?: string
+}
+
 export const api = {
+  getUpgrade: () => req<UpgradeState>('GET', '/v1/upgrade'),
+  startUpgrade: (target: string) => req<UpgradeState>('POST', '/v1/upgrade', { target }),
   listApps: () => req<{ apps: App[] }>('GET', '/v1/apps').then((r) => r.apps || []),
   listPresets: () => req<{ presets: Preset[] }>('GET', '/v1/presets').then((r) => r.presets || []),
   getSettings: () => req<Settings>('GET', '/v1/settings'),
@@ -346,7 +373,7 @@ export const api = {
 
   // API keys — session-only. The plaintext key is shown once on create.
   listApiKeys: () => req<{ keys: ApiKey[] }>('GET', '/v1/api-keys').then((r) => r.keys || []),
-  createApiKey: (name: string) => req<ApiKey & { key: string }>('POST', '/v1/api-keys', { name }),
+  createApiKey: (name: string, scopes: string[] = []) => req<ApiKey & { key: string }>('POST', '/v1/api-keys', { name, scopes }),
   revokeApiKey: (id: string) => req<void>('DELETE', `/v1/api-keys/${id}`),
 
   // Git credentials (for importing private repos in a later v0.4.x release).
@@ -362,19 +389,18 @@ export const api = {
     req<ManifestValidation>('POST', '/v1/runtime/manifest/validate', { manifest: mfst }),
   // Write one workspace file via the existing generic PUT endpoint (raw body).
   // Used by the explicit "Apply sandbox.yaml" CTA — console-only, no new endpoint.
-  // Read a workspace file. NOTE the path asymmetry: GET content is relative to
-  // the APP dir (e.g. "AGENTS.md"), while putWorkspaceFile is relative to the
-  // workspace MOUNT (e.g. "workspace/app/AGENTS.md"). Returns null on 404.
+  // Read a workspace file, APP-dir relative (e.g. "AGENTS.md"). Writes use the
+  // same root (PUT /files resolves against the app dir), so read and write take
+  // identical paths. Returns null on 404.
   // List workspace files. Pass recursive:true for the whole tree in one call.
   listFiles: (sandboxId: string, opts: { path?: string; recursive?: boolean } = {}) =>
     req<{ path: string; recursive: boolean; entries: FileEntry[] }>(
       'GET',
       `/v1/sandboxes/${sandboxId}/files?path=${encodeURIComponent(opts.path || '')}&recursive=${opts.recursive ? 'true' : 'false'}`,
     ),
-  // Write a file by its APP-relative path — hides the read(app-dir)/write(mount)
-  // root asymmetry so callers use one consistent path everywhere.
+  // Write a file by its APP-relative path (same root as the read above).
   writeAppFile: (sandboxId: string, appRelPath: string, content: string) =>
-    api.putWorkspaceFile(sandboxId, `workspace/app/${appRelPath}`, content),
+    api.putWorkspaceFile(sandboxId, appRelPath, content),
   // Download the whole workspace as a zip (href for an <a download>).
   exportUrl: (sandboxId: string) => `/v1/sandboxes/${sandboxId}/export`,
   getWorkspaceFile: async (sandboxId: string, appRelPath: string): Promise<string | null> => {
@@ -385,6 +411,24 @@ export const api = {
       throw new Error(`${res.status} ${res.statusText}`)
     }
     return res.text()
+  },
+  // Load an app's whole brain: the BRAIN.md hub plus any spoke notes under
+  // brain/ (topics that outgrew the hub). Missing dir/file = empty brain.
+  getAppBrain: async (sandboxId: string): Promise<{ hub: string | null; spokes: Record<string, string> }> => {
+    const hub = await api.getWorkspaceFile(sandboxId, 'BRAIN.md').catch(() => null)
+    const spokes: Record<string, string> = {}
+    try {
+      const l = await api.listFiles(sandboxId, { path: 'brain' })
+      const mds = (l.entries || []).filter((e) => e.type === 'file' && e.path.endsWith('.md'))
+      const contents = await Promise.all(mds.map((e) => api.getWorkspaceFile(sandboxId, e.path.startsWith('brain/') ? e.path : `brain/${e.path}`).catch(() => null)))
+      mds.forEach((e, i) => {
+        const c = contents[i]
+        if (typeof c !== 'string') return
+        const name = e.path.replace(/^brain\//, '').replace(/\.md$/, '')
+        spokes[name] = c
+      })
+    } catch { /* no brain/ directory yet */ }
+    return { hub, spokes }
   },
   putWorkspaceFile: async (sandboxId: string, path: string, content: string): Promise<void> => {
     const res = await fetch(`/v1/sandboxes/${sandboxId}/files?path=${encodeURIComponent(path)}`, {

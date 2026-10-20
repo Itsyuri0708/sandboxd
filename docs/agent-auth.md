@@ -44,7 +44,8 @@ wire. A task can neither read, exfiltrate, nor clobber the credential.
 Sandbox base URLs are `<proxy>/<agent>/<upstream>/…`; the proxy resolves the
 agent's stored credential for that upstream and injects it. Upstreams:
 `anthropic`, `openai`, `zen` (OpenCode Zen pay-as-you-go), `zengo` (OpenCode Zen
-"go" subscription).
+"go" subscription), and the MiniMax direct endpoints `minimax`,
+`minimax-cn` (China), `minimax-anthropic`, `minimax-anthropic-cn` (China).
 
 - **claude-code** — `ANTHROPIC_BASE_URL` = `<proxy>/claude-code/anthropic`,
   `ANTHROPIC_API_KEY` = `sandboxd-proxy-injected`. Works for both an API key and
@@ -59,6 +60,41 @@ agent's stored credential for that upstream and injects it. Upstreams:
   the proxy's resolved **IP**, and the task's model is rewritten to `proxy/<id>`.)
 - **codex** — parked: its ChatGPT-subscription backend is a WebSocket that can't be
   proxied yet, so codex is hidden from the run picker.
+
+- **MiniMax** — a credential-only provider: connect a MiniMax API key in
+  Settings → AI Agents (`POST /v1/agents/minimax/api-key`). MiniMax is not a
+  task agent (no CLI, not in the run picker); its key is injected by the proxy
+  for the MiniMax direct upstreams. The OpenCode opencode model dropdown exposes
+  `MiniMax-M3.1-Flash` first, followed by `MiniMax-M3`; selecting one routes the task to the MiniMax
+  OpenAI-compatible endpoint with the connected key (the China region is
+  selected with `SANDBOXD_MINIMAX_REGION=cn_zh`, default `global_en`).
+
+  | Region | OpenAI-compatible | Anthropic-compatible |
+  |--------|-------------------|----------------------|
+  | `global_en` *(default)* | `https://api.minimax.io/v1` | `https://api.minimax.io/anthropic` |
+  | `cn_zh` | `https://api.minimaxi.com/v1` | `https://api.minimaxi.com/anthropic` |
+
+  To use Flash for tasks with no model override, set the OpenCode default in
+  Settings to `MiniMax-M3.1-Flash` (or set `SANDBOXD_OPENCODE_MODEL`). Existing
+  saved defaults and explicit `MiniMax-M2.7` requests retain their original
+  model and direct route; the general OpenCode default is unchanged.
+
+  [MiniMax model metadata](https://platform.minimax.io/docs/guides/models-intro):
+  **MiniMax-M3.1-Flash** — 1,000,000-token context, up to 524,288 output tokens,
+  text/image/video input, adaptive-only thinking. OpenAI `reasoning_effort`
+  and Anthropic `output_config.effort` accept `low`, `medium`, `high`, `xhigh`,
+  and `max` (default); disabled thinking and effort `none` are unsupported.
+  Standard pricing is $0.15 / $0.60 / $0.015 per million input / output /
+  cache-read tokens. **MiniMax-M3** — 1,000,000-token context, image/video input,
+  adaptive or disabled thinking (OpenAI defaults to adaptive; Anthropic to
+  disabled); effort does not tune its depth. Standard pricing for input lengths
+  up to 512k is $0.30 / $1.20 / $0.06, and above 512k $0.60 / $2.40 / $0.12
+  per million input / output / cache-read tokens.
+  See the [API reference](https://platform.minimax.io/docs/api-reference/text-openai-api)
+  and [pricing](https://platform.minimax.io/docs/guides/pricing-paygo).
+  The proxy passes request bodies through, including tools, reasoning history,
+  and media; it does not add thinking/effort or `service_tier` parameters.
+  MiniMax endpoints authorize with `Authorization: Bearer <key>`.
 
 **The real credential never appears in the sandbox filesystem or env** — verify
 with `mount | grep agent-auth` (none) and `ls /run/agent-auth` (absent).
@@ -201,6 +237,7 @@ Operator knobs for agent auth & task defaults (all optional; sensible defaults s
 | `SANDBOXD_DEFAULT_AGENT` | `opencode` | Agent used for tasks that don't specify one. |
 | `SANDBOXD_OPENCODE_ZEN_PATH` | `zen` | OpenCode Zen endpoint for opencode: `zen` (pay-as-you-go, full catalog) or `zengo` (the "go" subscription's models). See [OpenCode Zen: subscription vs pay-as-you-go](#opencode-zen-subscription-vs-pay-as-you-go). |
 | `SANDBOXD_OPENCODE_MODEL` | *(unset)* | Global default `--model` for opencode tasks that don't pass one. |
+| `SANDBOXD_MINIMAX_REGION` | `global_en` | MiniMax direct endpoint region for MiniMax models: `global_en` (`api.minimax.io`) or `cn_zh` (`api.minimaxi.com`). Requires a connected MiniMax API key. |
 
 Per-task, `POST /tasks` also accepts `agent`, `model`, and `continue` (tri-state —
 see [Running a task](#running-a-task)).

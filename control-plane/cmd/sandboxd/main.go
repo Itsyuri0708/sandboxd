@@ -19,7 +19,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -47,12 +49,15 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/loopback"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
 	nginxwatch "github.com/tastyeffectco/sandboxd/control-plane/internal/nginx"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/previewhost"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/reaper"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/reconcile"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxspec"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/secrets"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/telemetry"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/upgrade"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/wake"
 )
 
@@ -69,8 +74,14 @@ const (
 	// bind-mounts this path host:container symmetric, so it is a valid
 	// host path for the sibling `docker run -v`. Override with
 	// SANDBOXD_DATA_DIR / SANDBOXD_LOG_DIR (paths derived in main()).
-	defaultDataDir = "/var/lib/sandboxed"
-	defaultLogDir  = "/var/log/sandboxed"
+	defaultDataDir = "/var/lib/sandboxd"
+	defaultLogDir  = "/var/log/sandboxd"
+
+	// The project used to be called "sandboxed"; installs from before the
+	// rename keep their data where it is. Never move data silently.
+	legacyDataDir = "/var/lib/sandboxed"
+	legacyLogDir  = "/var/log/sandboxed"
+	legacyEtcDir  = "/etc/sandboxed"
 
 	// Idle / pressure / wake defaults. Each overridable via env; see
 	// .env.example and README "Configuration".
@@ -124,8 +135,8 @@ func main() {
 	// dataDir; the compose file bind-mounts dataDir host:container
 	// symmetric so the path sandboxd writes is also a valid host path
 	// for the sibling `docker run -v <workspace>:/home/sandbox`.
-	dataDir := envDefault("SANDBOXD_DATA_DIR", defaultDataDir)
-	logDir := envDefault("SANDBOXD_LOG_DIR", defaultLogDir)
+	dataDir := envDefault("SANDBOXD_DATA_DIR", legacyAware(defaultDataDir, legacyDataDir))
+	logDir := envDefault("SANDBOXD_LOG_DIR", legacyAware(defaultLogDir, legacyLogDir))
 	stateDir := filepath.Join(dataDir, "state")
 	dbPath := filepath.Join(stateDir, "sandboxd.db")
 	workspacesRoot := filepath.Join(dataDir, "workspaces")
@@ -140,6 +151,26 @@ func main() {
 	userns := envDefault("SANDBOXD_USERNS", "host") // sandbox + seed --userns; "host" is deterministic on any daemon
 	previewEntrypoint := envDefault("PREVIEW_ENTRYPOINT", "web")
 	previewTLS := boolFromEnv("PREVIEW_TLS", false)
+	previewURLScheme := strings.ToLower(strings.TrimSpace(os.Getenv("PREVIEW_URL_SCHEME")))
+	if previewURLScheme != "" && previewURLScheme != "http" && previewURLScheme != "https" {
+		fmt.Fprintf(os.Stderr, "PREVIEW_URL_SCHEME must be http, https, or empty (got %q)\n", previewURLScheme)
+		os.Exit(2)
+	}
+	// Hostname layout under PREVIEW_DOMAIN: nested (s-<id>-<port>.preview.<D>,
+	// the default) or flat (s-<id>-<port>[--tag].<D>, so one *.<D> wildcard
+	// certificate covers every host and several instances can share a
+	// domain by tag).
+	previewHostStyle, err := previewhost.ParseStyle(os.Getenv("PREVIEW_HOST_STYLE"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(2)
+	}
+	previewHostTag := strings.TrimSpace(os.Getenv("PREVIEW_HOST_TAG"))
+	if !previewhost.ValidTag(previewHostTag) {
+		fmt.Fprintf(os.Stderr, "PREVIEW_HOST_TAG must match [a-z0-9][a-z0-9-]{0,30} (got %q)\n", previewHostTag)
+		os.Exit(2)
+	}
+	hosts, _ := previewhost.New(domain, previewHostStyle, previewHostTag)
 	// Host-facing port the preview/console URLs are reached on (compose passes
 	// the published HTTP_PORT here). Default "80": bare URLs on a dedicated host.
 	publicHTTPPort := envDefault("SANDBOXD_PUBLIC_HTTP_PORT", "80")
@@ -189,7 +220,7 @@ func main() {
 	// already loaded the EnvironmentFile); SIGHUP re-reads the file.
 	auditLog := audit.New(st, log.With("component", "audit"))
 	eventRec := events.New(st, log.With("component", "events"))
-	envFile := envDefault("SANDBOXD_ENV_FILE", "/etc/sandboxed/sandboxd.env")
+	envFile := envDefault("SANDBOXD_ENV_FILE", legacyAware("/etc/sandboxd/sandboxd.env", legacyEtcDir+"/sandboxd.env"))
 	authCfg := auth.ParseConfig(os.Getenv)
 	// The credential resolver validates DB-backed console sessions and API keys;
 	// env-configured SANDBOXD_API_TOKENS remain a fallback for the bootstrap key.
@@ -339,7 +370,7 @@ func main() {
 	}
 
 	wakeHandler, err := wake.New(
-		st, dockerClient, domain,
+		st, dockerClient, hosts,
 		wake.Config{
 			TCPReadyTimeout: wakeTCPReady,
 			RefreshSeconds:  2,
@@ -414,25 +445,117 @@ func main() {
 	// handler; a background goroutine below keeps its cache warm.
 	updateChecker := &telemetry.Checker{}
 
+	// gVisor (opt-in): SANDBOXD_RUNTIME=runsc runs sandboxes under runsc.
+	// gVisor's netstack can't reach Docker's embedded DNS (127.0.0.11) on a
+	// user-defined network, so we write a resolv.conf with real nameservers
+	// (SANDBOXD_DNS, default public resolvers) and bind-mount it into each
+	// sandbox. Requires runsc registered with `--host-uds=create` (docs/gvisor.md).
+	sbxRuntime := envDefault("SANDBOXD_RUNTIME", "")
+	var dnsResolvConf string
+	if sbxRuntime == "runsc" {
+		var ns []string
+		for _, d := range strings.Split(os.Getenv("SANDBOXD_DNS"), ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				ns = append(ns, d)
+			}
+		}
+		if len(ns) == 0 {
+			ns = []string{"1.1.1.1", "8.8.8.8"}
+		}
+		var b strings.Builder
+		for _, n := range ns {
+			fmt.Fprintf(&b, "nameserver %s\n", n)
+		}
+		dnsResolvConf = filepath.Join(dataDir, "gvisor-resolv.conf")
+		if err := os.WriteFile(dnsResolvConf, []byte(b.String()), 0o644); err != nil {
+			log.Error("gvisor: write resolv.conf failed; sandbox DNS may not resolve", "err", err.Error())
+			dnsResolvConf = ""
+		} else {
+			log.Info("gvisor runtime enabled", "runtime", sbxRuntime, "dns", ns)
+		}
+		// gVisor sandboxes use public DNS (above) and can't reach Docker's
+		// embedded resolver, so an internal service name like "sandboxd" won't
+		// resolve inside them. Pin the agent proxy URL to its IP — the control
+		// plane (not under gVisor) can resolve it — so sandboxes reach the proxy
+		// by address. Without this, every agent task hangs/fails on DNS.
+		if u, perr := url.Parse(agentProxyURL); perr == nil && u.Hostname() != "" && net.ParseIP(u.Hostname()) == nil {
+			if ips, lerr := net.LookupHost(u.Hostname()); lerr == nil && len(ips) > 0 {
+				if p := u.Port(); p != "" {
+					u.Host = net.JoinHostPort(ips[0], p)
+				} else {
+					u.Host = ips[0]
+				}
+				log.Info("gvisor: pinned agent proxy to IP", "from", agentProxyURL, "to", u.String())
+				agentProxyURL = u.String()
+			} else {
+				log.Warn("gvisor: could not resolve agent proxy host to IP; sandboxes may fail to reach it", "host", u.Hostname())
+			}
+		}
+	}
+
+	// Self-healing start: rebuild a container that is missing, or that was
+	// created from an older base image than we now run. The base image carries
+	// runtimed (the in-sandbox supervisor), so without this an upgrade never
+	// reaches long-lived sandboxes and they keep the old supervisor — and miss
+	// new agent/model support. Lossless: everything durable is in the workspace
+	// bind mount, and the container rootfs is read-only by construction.
+	wakeHandler.Image = image
+	wakeHandler.Recreate = func(ctx context.Context, sb *store.Sandbox) error {
+		spec := sandboxspec.Build(sb, sandboxspec.Env{
+			Image:             image,
+			Network:           network,
+			Userns:            userns,
+			Runtime:           sbxRuntime,
+			DNSResolvConf:     dnsResolvConf,
+			PreviewDomain:     domain,
+			PreviewHostStyle:  hosts.Style,
+			PreviewHostTag:    hosts.Tag,
+			PreviewEntrypoint: previewEntrypoint,
+			PreviewTLS:        previewTLS,
+			AgentProxyURL:     agentProxyURL,
+			OpencodeModel:     envDefault("SANDBOXD_OPENCODE_MODEL", ""),
+			OpencodeZenPath:   envDefault("SANDBOXD_OPENCODE_ZEN_PATH", ""),
+			RuntimePreset:     runtimePresetForSandbox(ctx, st, sb),
+		})
+		// Remove any existing container first so the name is free; ignore a
+		// not-found (the common case) and let Run surface a real failure.
+		if err := dockerClient.Remove(ctx, spec.Name); err != nil && err != docker.ErrNotFound {
+			log.Warn("recreate: remove existing container failed (continuing)", "err", err.Error())
+		}
+		_, err := dockerClient.Run(ctx, spec)
+		return err
+	}
+
 	server := &api.Server{
-		Store:               st,
-		Secrets:             secretsCipher,
-		Update:              updateChecker,
-		AgentAuth:           agentAuth,
-		AgentOAuth:          agentOAuth,
-		OpencodeModel:       envDefault("SANDBOXD_OPENCODE_MODEL", ""),
-		OpencodeZenPath:     envDefault("SANDBOXD_OPENCODE_ZEN_PATH", ""),
-		DefaultAgent:        defaultAgent,
-		AgentProxyURL:       agentProxyURL,
-		Docker:              dockerClient,
-		Loopback:            loopMgr,
-		Log:                 log.With("component", "api"),
-		PreviewDomain:       domain,
-		Image:               image,
-		Network:             network,
-		Userns:              userns,
-		PreviewEntrypoint:   previewEntrypoint,
-		PreviewTLS:          previewTLS,
+		Store:             st,
+		Secrets:           secretsCipher,
+		Update:            updateChecker,
+		AgentAuth:         agentAuth,
+		AgentOAuth:        agentOAuth,
+		OpencodeModel:     envDefault("SANDBOXD_OPENCODE_MODEL", ""),
+		OpencodeZenPath:   envDefault("SANDBOXD_OPENCODE_ZEN_PATH", ""),
+		DefaultAgent:      defaultAgent,
+		AgentProxyURL:     agentProxyURL,
+		Docker:            dockerClient,
+		Loopback:          loopMgr,
+		Log:               log.With("component", "api"),
+		PreviewDomain:     domain,
+		PreviewHostStyle:  hosts.Style,
+		PreviewHostTag:    hosts.Tag,
+		Image:             image,
+		Network:           network,
+		Userns:            userns,
+		Runtime:           sbxRuntime,
+		DNSResolvConf:     dnsResolvConf,
+		PreviewEntrypoint: previewEntrypoint,
+		PreviewTLS:        previewTLS,
+		PreviewURLScheme:  previewURLScheme,
+		Upgrade: &upgrade.Manager{
+			Docker: dockerClient, DataDir: dataDir, Version: version,
+			SrcDir:        os.Getenv("SANDBOXD_SRC_DIR"),
+			UpgraderImage: envDefault("SANDBOXD_UPGRADER_IMAGE", "sandboxd-upgrader:"+version),
+			ReleaseExists: releaseExists,
+		},
 		PublicHTTPPort:      publicHTTPPort,
 		SetMemoryHigh:       setMemoryHigh,
 		Inflight:            inflight,
@@ -449,7 +572,7 @@ func main() {
 		ForwardAuthDenyMode: denyMode,
 		TemplatesDir:        envDefault("SANDBOXD_TEMPLATES_DIR", templatesRoot),
 		LibraryRoot:         envDefault("SANDBOXD_LIBRARY_DIR", libraryRoot),
-		LLMTxtPath:          envDefault("SANDBOXD_LLM_TXT_PATH", "/etc/sandboxed/llm.txt"),
+		LLMTxtPath:          envDefault("SANDBOXD_LLM_TXT_PATH", legacyAware("/etc/sandboxd/llm.txt", legacyEtcDir+"/llm.txt")),
 		Instance: api.InstanceInfo{
 			Version:              version,
 			GitCommit:            gitCommit,
@@ -524,15 +647,21 @@ func main() {
 	}()
 
 	// Anonymous usage heartbeat. ON by default; disabled via SANDBOXD_TELEMETRY=off
-	// or DO_NOT_TRACK=1. The reporter only ever sends a random instance UUID, the
-	// version, GOOS/GOARCH, a coarse sandbox-count bucket, and two feature flags —
-	// no hostnames, IPs, paths, or user content (see docs/telemetry.md).
+	// or DO_NOT_TRACK=1. Everything sent is bucketed or enumerated — no hostnames,
+	// IPs, paths, names, or user content. docs/telemetry.md lists every field.
 	if telemetry.EnabledFromEnv(os.Getenv) {
 		instanceID, isNew, idErr := telemetry.InstanceID(filepath.Join(stateDir, "instance-id"))
 		if idErr != nil {
 			log.Warn("telemetry: could not establish instance id — telemetry disabled", "err", idErr.Error())
 		} else {
 			log.Info("telemetry: anonymous version + daily heartbeat enabled (no code/PII); disable with SANDBOXD_TELEMETRY=off")
+			cloudOrg := strings.TrimSpace(os.Getenv("SANDBOXD_CLOUD_ORG"))
+			if cloudOrg != "" {
+				// Cloud subscribers explicitly opt into linked product analytics in
+				// the Cloud installer. This joins acquisition, billing and safe usage
+				// buckets without sending app names, prompts, code, or file paths.
+				instanceID = "cloud:" + cloudOrg
+			}
 			reporter := &telemetry.Reporter{
 				InstanceID: instanceID,
 				Version:    version,
@@ -543,20 +672,52 @@ func main() {
 					envDefault("SANDBOXD_POSTHOG_HOST", telemetry.DefaultPostHogHost),
 					envDefault("SANDBOXD_POSTHOG_KEY", telemetry.DefaultPostHogKey),
 				),
-				Snapshot: func() (int, bool, bool) {
-					count := 0
+				Snapshot: func() telemetry.Snapshot {
+					s := telemetry.Snapshot{
+						CloudOrg:      cloudOrg,
+						AuthEnabled:   !authCfg.Disabled,
+						PreviewDomain: domain,
+						PreviewTLS:    previewTLS,
+						AgentDefault:  envDefault("SANDBOXD_DEFAULT_AGENT", "opencode"),
+						Runtime:       runtimeLabel(sbxRuntime),
+						EgressMode:    egressModeLabel(egressMgr),
+						StorageMode:   "directory",
+						InstallMethod: envDefault("SANDBOXD_INSTALL_METHOD", "unknown"),
+						CPUs:          runtime.NumCPU(),
+						MemBytes:      telemetry.HostMemBytes(),
+					}
 					if list, err := st.List(gctx); err == nil {
-						count = len(list)
+						s.SandboxCount = len(list)
 					}
-					consoleEnabled := false
+					if n, err := st.CountApps(gctx); err == nil {
+						s.AppCount = n
+					}
+					if n, err := st.CountTasksSince(gctx, time.Now().Add(-7*24*time.Hour).Unix()); err == nil {
+						s.Tasks7d = n
+					}
 					if h, err := st.GetPasswordHash(gctx); err == nil && h != "" {
-						consoleEnabled = true
+						s.ConsoleEnabled = true
 					}
-					return count, !authCfg.Disabled, consoleEnabled
+					if v, err := dockerClient.ServerVersion(gctx); err == nil {
+						s.DockerVersion = v
+					}
+					return s
 				},
 				Log: log.With("component", "telemetry"),
 			}
 			go reporter.Run(gctx)
+			// A finished console-driven upgrade (recorded in <data>/state/upgrade.json
+			// by the upgrader) is reported once: from → to → result. CLI upgrades
+			// leave no state file and are therefore not reported.
+			if server.Upgrade != nil {
+				if ust := server.Upgrade.Status(gctx); !ust.Reported &&
+					(ust.Phase == "succeeded" || ust.Phase == "failed" || ust.Phase == "rolled_back") {
+					go reporter.Emit(gctx, "upgrade", telemetry.UpgradeProps(ust.From, ust.Target, ust.Phase, "console"))
+					if err := server.Upgrade.MarkReported(); err != nil {
+						log.Debug("telemetry: could not mark upgrade reported", "err", err.Error())
+					}
+				}
+			}
 		}
 	}
 
@@ -593,7 +754,7 @@ func main() {
 	tailer := &activity.Tailer{
 		LogPath:        envDefault("SANDBOXD_ACCESS_LOG", accessLogPath),
 		CheckpointPath: envDefault("SANDBOXD_TAILER_OFFSET", tailerOffsetFs),
-		PreviewDomain:  domain,
+		Hosts:          hosts,
 		Store:          st,
 		Log:            log.With("component", "access-log-tailer"),
 	}
@@ -688,6 +849,9 @@ func main() {
 		log.Info("startup: listening",
 			"addr", addr,
 			"preview_domain", domain,
+			"preview_host_style", hosts.Style,
+			"preview_host_tag", hosts.Tag,
+			"preview_host_example", hosts.Preview("<id>", 3000),
 			"image", image,
 			"idle_threshold", idleThreshold.String(),
 			"idle_interval", idleInterval.String(),
@@ -745,7 +909,7 @@ func main() {
 }
 
 // hostDispatch routes incoming requests to either the wake catch-all
-// (when Host header matches s-<id>-<port>.preview.<domain>) or the
+// (when Host header matches the preview host shape) or the
 // loopback API. Both share the same listener so the operator only
 // has to wire one entry into Traefik's file provider.
 func hostDispatch(w *wake.Handler, apiMux http.Handler, _ any) http.Handler {
@@ -884,6 +1048,18 @@ func pollerModeLabel(re *regexp.Regexp) string {
 	return "active"
 }
 
+// runtimeLabel reduces SANDBOXD_RUNTIME to the enumerated label telemetry sends.
+func runtimeLabel(r string) string {
+	switch {
+	case r == "":
+		return "runc"
+	case strings.Contains(r, "runsc") || strings.Contains(r, "gvisor"):
+		return "gvisor"
+	default:
+		return "other"
+	}
+}
+
 // egressModeLabel is the safe egress mode string for GET /v1/settings. A nil
 // manager (the OSS default) means no egress policy is enforced.
 func egressModeLabel(m *egress.Manager) string {
@@ -933,4 +1109,47 @@ func buildIdent() (version, gitCommit string) {
 		gitCommit = gitCommit[:12]
 	}
 	return version, gitCommit
+}
+
+// runtimePresetForSandbox returns the owning app's runtime preset, so a
+// recreated container gets the same RUNTIMED_RUNTIME_PRESET it was created
+// with. Best-effort: an unknown app just means runtimed uses its default.
+func runtimePresetForSandbox(ctx context.Context, st *store.Store, sb *store.Sandbox) string {
+	if sb == nil || !sb.AppID.Valid || sb.AppID.String == "" {
+		return ""
+	}
+	app, err := st.GetApp(ctx, sb.AppID.String)
+	if err != nil || app == nil || !app.RuntimePreset.Valid {
+		return ""
+	}
+	return app.RuntimePreset.String
+}
+
+// legacyAware returns preferred unless it does not exist and the pre-rename
+// path does — the "sandboxed" → "sandboxd" rename must never strand an
+// existing install's files.
+func legacyAware(preferred, legacy string) string {
+	if _, err := os.Stat(preferred); err == nil {
+		return preferred
+	}
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	return preferred
+}
+
+// releaseExists reports whether tag is a published GitHub release — the only
+// targets the console may upgrade to. Best-effort: network failure = false.
+func releaseExists(ctx context.Context, tag string) bool {
+	req, err := http.NewRequestWithContext(ctx,
+		"GET", "https://api.github.com/repos/tastyeffectco/sandboxd/releases/tags/"+tag, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }

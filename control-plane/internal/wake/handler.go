@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -21,25 +20,27 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/egress"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/idlock"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/previewhost"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxspec"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
 // Handler implements both HTML and JSON wake entry points.
 //
 //   - Traefik catch-all: arrives as any HTTP method/path with Host
-//     header `s-<id>-<port>.preview.<domain>`. ServeHTTP detects the
+//     header matching the preview host shape (see previewhost). ServeHTTP detects the
 //     shape via the Host regex and returns an HTML meta-refresh.
 //
 //   - Programmatic: arrives at POST /wake/{id} on the loopback API.
 //     The path-value provides the id; Accept: application/json (or
 //     no Host that matches preview shape) → JSON.
 type Handler struct {
-	Store         *store.Store
-	Docker        *docker.Client
-	PreviewDomain string
-	Cfg           Config
-	Admit         AdmitConfig
-	Log           *slog.Logger
+	Store  *store.Store
+	Docker *docker.Client
+	Hosts  previewhost.Scheme
+	Cfg    Config
+	Admit  AdmitConfig
+	Log    *slog.Logger
 
 	// Phase 6 — egress sources policy. nil-safe (the wake path still
 	// works without egress; the kernel just won't see the new bridge
@@ -64,11 +65,27 @@ type Handler struct {
 	// --memory ceiling on the container still applies.
 	SetMemoryHigh bool
 
+	// Recreate rebuilds a sandbox container from its stored row when the
+	// container is missing, or was created from an older base image than the
+	// instance now runs (an upgrade rebuilt the image, and with it runtimed —
+	// the in-sandbox supervisor). Without this, long-lived sandboxes keep an
+	// old runtimed forever and miss new agent/model support. nil-safe: when
+	// unset the wake path behaves exactly as before.
+	Recreate RecreateFunc
+
+	// Image is the base image the instance currently runs; a container built
+	// from a different one is stale (see Recreate).
+	Image string
+
 	hostRE *regexp.Regexp
 
 	mu       sync.Mutex
 	inflight map[string]*inflightWake
 }
+
+// RecreateFunc rebuilds the container for a sandbox row (workspace preserved)
+// and returns nil when the container is ready to start.
+type RecreateFunc func(ctx context.Context, sb *store.Sandbox) error
 
 // Config holds the env-tunable knobs the handler needs.
 type Config struct {
@@ -95,30 +112,24 @@ type jsonErrResp struct {
 }
 
 // New returns a Handler. The host regex is compiled once.
-func New(s *store.Store, d *docker.Client, previewDomain string, cfg Config, admit AdmitConfig, eg *egress.Manager, locks *idlock.Registry, log *slog.Logger) (*Handler, error) {
+func New(s *store.Store, d *docker.Client, hosts previewhost.Scheme, cfg Config, admit AdmitConfig, eg *egress.Manager, locks *idlock.Registry, log *slog.Logger) (*Handler, error) {
 	if cfg.RefreshSeconds <= 0 {
 		cfg.RefreshSeconds = 2
 	}
 	if cfg.TCPReadyTimeout <= 0 {
 		cfg.TCPReadyTimeout = 8 * time.Second
 	}
-	pat := `^s-([0-9A-Za-z]+)-([0-9]+)\.preview\.` +
-		regexp.QuoteMeta(previewDomain) + `(?::\d+)?$`
-	re, err := regexp.Compile(pat)
-	if err != nil {
-		return nil, fmt.Errorf("compile preview-host regex: %w", err)
-	}
 	return &Handler{
-		Store:         s,
-		Docker:        d,
-		PreviewDomain: previewDomain,
-		Cfg:           cfg,
-		Admit:         admit,
-		Egress:        eg,
-		Locks:         locks,
-		Log:           log,
-		hostRE:        re,
-		inflight:      map[string]*inflightWake{},
+		Store:    s,
+		Docker:   d,
+		Hosts:    hosts,
+		Cfg:      cfg,
+		Admit:    admit,
+		Egress:   eg,
+		Locks:    locks,
+		Log:      log,
+		hostRE:   hosts.HostRegexp(),
+		inflight: map[string]*inflightWake{},
 	}, nil
 }
 
@@ -216,6 +227,26 @@ func (h *Handler) serve(r *http.Request, w http.ResponseWriter, id, port string,
 		return
 	}
 
+	// 1b. A row can say running while its container is gone (removed by
+	// hand, pruned) or has exited (OOM kill, crash). Traefik has already
+	// dropped the route, so the request lands here — answering "already
+	// running" would refresh the browser back into this page forever.
+	// Treat the row as stopped and take the normal start path below
+	// (2b recreates a missing container). The boot reconciler makes the
+	// same check, but only once at startup.
+	if sb.Status == "running" && h.containerGone(ctx, id, log) {
+		if err := h.Store.MarkStopped(ctx, id); err != nil {
+			wf.err = err
+			log.Warn("wake: MarkStopped on a running row with no container failed", "err", err.Error())
+			h.respondError(w, id, "internal_error", isHTML)
+			metrics.Wakes.WithLabelValues("error").Inc()
+			return
+		}
+		// sb.ContainerIP is left as-is so step 4b drops the old IP's
+		// egress rule once the container has its new one.
+		sb.Status = "stopped"
+	}
+
 	switch sb.Status {
 	case "running":
 		// Traefik may not have observed the route yet (catch-all
@@ -276,6 +307,48 @@ func (h *Handler) serve(r *http.Request, w http.ResponseWriter, id, port string,
 		h.respondAdmissionDenied(w, id, outcome, isHTML)
 		metrics.Wakes.WithLabelValues("admission_denied").Inc()
 		return
+	}
+
+	// 2b. Self-heal the container before starting it. Two cases, both fixed by
+	// rebuilding from the stored row (all durable state is in the workspace
+	// bind mount, so this is lossless):
+	//   - the container is gone (pruned, or removed by hand)
+	//   - it was created from an older base image than we run now, i.e. an
+	//     upgrade rebuilt the image and its runtimed. Starting it as-is would
+	//     silently keep the OLD in-sandbox supervisor and miss new agent/model
+	//     support ("Model X is not supported" on an up-to-date install).
+	//   - PREVIEW_DOMAIN changed since it was created: its Traefik routers
+	//     still answer to the old host, so the new preview URL never resolves.
+	if h.Recreate != nil {
+		stale := false
+		cur, ierr := h.Docker.Inspect(ctx, "s-"+id)
+		switch {
+		case ierr == docker.ErrNotFound:
+			stale = true
+			log.Info("wake: container missing — recreating from the stored row")
+		case ierr != nil:
+			log.Warn("wake: pre-start inspect failed (continuing)", "err", ierr.Error())
+		case sandboxspec.NeedsRecreate(cur.Config.Image, h.Image):
+			stale = true
+			log.Info("wake: container built from an older image — recreating",
+				"container_image", cur.Config.Image, "current_image", h.Image)
+		case sandboxspec.PreviewLabelsStale(cur.Config.Labels, h.Hosts):
+			// PREVIEW_DOMAIN changed since this container was created: its
+			// Traefik routers still point at the old host, so its new preview
+			// URL would fall through to this wake page forever.
+			stale = true
+			log.Info("wake: preview routers target an old PREVIEW_DOMAIN — recreating",
+				"current_domain", h.Hosts.Domain)
+		}
+		if stale {
+			if err := h.Recreate(ctx, sb); err != nil {
+				wf.err = err
+				log.Warn("wake: recreate failed", "err", err.Error())
+				h.respondError(w, id, "recreate_failed", isHTML)
+				metrics.Wakes.WithLabelValues("recreate_failed").Inc()
+				return
+			}
+		}
 	}
 
 	// 3. docker start (idempotent).
@@ -396,7 +469,28 @@ func (h *Handler) serve(r *http.Request, w http.ResponseWriter, id, port string,
 	h.respondSuccess(w, id, dur, isHTML)
 }
 
-// gatePrivateWake runs the /forward-auth preview-token check against
+// containerGone reports whether a sandbox whose row says running has no
+// live container behind it: missing, or present but not running. Any
+// other inspect error trusts the row, so a docker CLI hiccup can't
+// bounce a healthy sandbox.
+func (h *Handler) containerGone(ctx context.Context, id string, log *slog.Logger) bool {
+	cj, err := h.Docker.Inspect(ctx, "s-"+id)
+	switch {
+	case errors.Is(err, docker.ErrNotFound):
+		log.Warn("wake: row says running but the container is missing — treating as stopped")
+		return true
+	case err != nil:
+		log.Warn("wake: inspect of a running row failed (trusting the row)", "err", err.Error())
+		return false
+	case !cj.State.Running:
+		log.Warn("wake: row says running but the container is not — treating as stopped",
+			"docker_state", cj.State.Status)
+		return true
+	}
+	return false
+}
+
+// gatePrivateWakeruns the /forward-auth preview-token check against
 // the request cookie for a stopped private sandbox. It returns true
 // (and has already written a 302 / 401 response) when the wake must
 // be refused; false when the caller may proceed. Fails OPEN when Auth

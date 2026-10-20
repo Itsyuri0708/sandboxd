@@ -41,6 +41,7 @@ type RunSpec struct {
 	Hostname    string   // --hostname
 	Network     string   // --network (OSS: shared sandboxd_net so Traefik can route)
 	Userns      string   // --userns (OSS: "host" for deterministic workspace ownership)
+	Runtime     string   // --runtime ("runsc"=gVisor); "" = daemon default (runc)
 	ReadOnly    bool     // --read-only
 	CapDrop     []string // --cap-drop=ALL (passed once per entry)
 	SecurityOpt []string // --security-opt=no-new-privileges
@@ -71,6 +72,9 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) (string, error) {
 	}
 	if spec.Userns != "" {
 		args = append(args, "--userns", spec.Userns)
+	}
+	if spec.Runtime != "" {
+		args = append(args, "--runtime", spec.Runtime)
 	}
 	if spec.ReadOnly {
 		args = append(args, "--read-only")
@@ -333,6 +337,17 @@ func (c *Client) ListByNamePrefix(ctx context.Context, prefix string) ([]string,
 		}
 	}
 	return names, nil
+}
+
+// ServerVersion returns the daemon version via `docker version`, which keeps
+// working on daemons where `docker info` fails to render (seen on 28.5:
+// "netip.ParsePrefix: no '/'"). Used by telemetry; readyz keeps using Info.
+func (c *Client) ServerVersion(ctx context.Context) (string, error) {
+	out, err := c.run(ctx, "version", "--format", "{{.Server.Version}}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // Info runs `docker info -f {{.ServerVersion}}` for the readyz probe.

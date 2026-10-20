@@ -26,6 +26,26 @@ info() { printf '  \033[36m›\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 die()  { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# ── anonymous install-failure beacon ─────────────────────────────────
+# If the installer aborts, send ONE event: {stage} + a random id — nothing
+# else (no hostname, IP, paths or output). Same opt-out as the daemon:
+# SANDBOXD_TELEMETRY=off or DO_NOT_TRACK=1. See docs/telemetry.md.
+STAGE=prereqs
+tel_off() {
+  case "$(printf '%s' "${SANDBOXD_TELEMETRY:-}" | tr 'A-Z' 'a-z')" in off|0|false|no) return 0;; esac
+  case "$(printf '%s' "${DO_NOT_TRACK:-}" | tr 'A-Z' 'a-z')" in 1|true|yes) return 0;; esac
+  return 1
+}
+tel_fail() {
+  tel_off && return 0
+  id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo unknown)"
+  curl -s -m 5 -o /dev/null -X POST "${SANDBOXD_POSTHOG_HOST:-https://us.i.posthog.com}/i/v0/e/" \
+    -H 'Content-Type: application/json' \
+    -d "{\"api_key\":\"${SANDBOXD_POSTHOG_KEY:-phc_pma2C4Wg9EKf4KARJbnU5ZdcNDJGnA5oDtsypKofF2YY}\",\"event\":\"install_failed\",\"distinct_id\":\"$id\",\"properties\":{\"stage\":\"$1\",\"\$ip\":\"\"}}" \
+    2>/dev/null || true
+}
+trap 'rc=$?; [ "$rc" -ne 0 ] && tel_fail "$STAGE"; exit $rc' EXIT
+
 # ── bootstrap: fetch the repo when run standalone (curl … | bash) ────
 # Piped from curl, this script has no repo around it. Detect that, clone
 # sandboxd, and re-exec the in-repo installer. Overridable via env:
@@ -51,6 +71,7 @@ fi
 cd "$REPO_ROOT"
 
 # ── docker / sudo detection ──────────────────────────────────────────
+STAGE=docker
 # Use sudo for docker only if the current user can't reach the daemon.
 DOCKER="docker"
 if ! docker info >/dev/null 2>&1; then
@@ -76,6 +97,7 @@ ok "Docker:  $($DOCKER version --format '{{.Server.Version}}' 2>/dev/null || ech
 ok "Compose: $($COMPOSE version --short 2>/dev/null || echo present)"
 
 # ── .env ─────────────────────────────────────────────────────────────
+STAGE=env
 if [ ! -f .env ]; then
   cp .env.example .env
   ok "created .env from .env.example"
@@ -95,11 +117,22 @@ fi
 
 # Load .env so we know the data dir / image tag to use below.
 set -a; . ./.env; set +a
-DATA_DIR="${SANDBOXD_DATA_DIR:-/var/lib/sandboxed}"
+
+# Pre-rename installs keep their data at /var/lib/sandboxed. If .env does not pin
+# SANDBOXD_DATA_DIR and the old directory exists, pin it now — never move data.
+if [ -z "${SANDBOXD_DATA_DIR:-}" ] && [ -d /var/lib/sandboxed ] && [ ! -d /var/lib/sandboxd ]; then
+  SANDBOXD_DATA_DIR=/var/lib/sandboxed; export SANDBOXD_DATA_DIR
+  if [ -f .env ] && ! grep -q '^SANDBOXD_DATA_DIR=' .env; then
+    printf 'SANDBOXD_DATA_DIR=/var/lib/sandboxed\nSANDBOXD_LOG_DIR=/var/lib/sandboxed/log\n' >> .env
+  fi
+  echo "  › data stays at /var/lib/sandboxed (pre-rename install); new installs use /var/lib/sandboxd"
+fi
+DATA_DIR="${SANDBOXD_DATA_DIR:-/var/lib/sandboxd}"
 LOG_DIR="${SANDBOXD_LOG_DIR:-$DATA_DIR/log}"
 BASE_IMAGE="${SANDBOXD_IMAGE:-sandboxd-base:0.3.0}"
 
 # ── data dir ─────────────────────────────────────────────────────────
+STAGE=data-dir
 # Create it (sudo if we don't own the parent). Workspaces + SQLite + the
 # shared access log live here.
 if [ ! -d "$DATA_DIR" ]; then
@@ -114,11 +147,13 @@ fi
 ok "data dir ready: $DATA_DIR"
 
 # ── build the sandbox base image ─────────────────────────────────────
+STAGE=base-image
 bold "Building the sandbox base image (one-time, a few minutes)…"
 DOCKER="$DOCKER" SANDBOXD_IMAGE="$BASE_IMAGE" bash image/build.sh "${BASE_IMAGE##*:}"
 ok "base image: $BASE_IMAGE"
 
 # ── API auth bootstrap key ───────────────────────────────────────────
+STAGE=api-key
 # Auth is ON by default: every /v1 call needs a console session or an API key.
 # Seed ONE printed bootstrap key so scripts (and the engine) work with zero
 # config. The console itself does NOT use this key — it uses a login/session.
@@ -132,7 +167,8 @@ if [ -z "$CUR_TOKENS" ]; then
     RAND="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')"
   fi
   API_KEY="sk_${RAND}"
-  tmp="$(mktemp)"; grep -vE '^SANDBOXD_API_TOKENS=' .env > "$tmp" 2>/dev/null || true; mv "$tmp" .env
+  # BSD/macOS mktemp needs an explicit template (GNU works without one).
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"; grep -vE '^SANDBOXD_API_TOKENS=' .env > "$tmp" 2>/dev/null || true; mv "$tmp" .env
   printf 'SANDBOXD_API_TOKENS=default=%s\n' "$API_KEY" >> .env
   ok "API bootstrap key generated (shown at the end)"
 else
@@ -142,6 +178,7 @@ else
 fi
 
 # ── optional web console (ON by default) ─────────────────────────────
+STAGE=console
 # The console is the fastest way to *see* sandboxd. On first open it asks you to
 # create a password (control-plane login); no secret in .env. Headless with
 # SANDBOXD_CONSOLE=0  or  --no-console.
@@ -154,11 +191,12 @@ PROFILE_ARGS=""
 # Stash the console URL + bootstrap key (gitignored, 0600) so ./console-login.sh
 # can show them again anytime.
 {
-  printf 'console_url=http://console.%s%s\n' "${PREVIEW_DOMAIN:-localhost}" "$([ "${HTTP_PORT:-80}" != "80" ] && printf ':%s' "${HTTP_PORT:-80}")"
+  printf 'console_url=http://%s%s\n' "${CONSOLE_HOST:-console.${PREVIEW_DOMAIN:-localhost}}" "$([ "${HTTP_PORT:-80}" != "80" ] && printf ':%s' "${HTTP_PORT:-80}")"
   printf 'api_key=%s\n' "$API_KEY"
 } > .console-login 2>/dev/null && chmod 600 .console-login
 
 # ── build + start the stack ──────────────────────────────────────────
+STAGE=stack
 # Compose must read SANDBOXD_API_TOKENS straight from .env. A stale empty value
 # inherited into this shell from the earlier `. ./.env` would outrank .env and
 # shadow the bootstrap key we just wrote (leaving auth on with no working key).
@@ -166,6 +204,16 @@ PROFILE_ARGS=""
 unset SANDBOXD_API_TOKENS
 # Stamp the build (sandboxd version / telemetry / settings) from git when present.
 export SANDBOXD_VERSION="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
+# Record the checkout path for console-driven upgrades (POST /v1/upgrade), and
+# build the tiny upgrader image (docker CLI + compose + git) that runs them.
+grep -q '^SANDBOXD_INSTALL_METHOD=' .env 2>/dev/null || printf 'SANDBOXD_INSTALL_METHOD=%s\n' "${SANDBOXD_INSTALL_METHOD:-install.sh}" >> .env
+if ! grep -q '^SANDBOXD_SRC_DIR=.' .env 2>/dev/null; then
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"; grep -vE '^SANDBOXD_SRC_DIR=' .env > "$tmp" 2>/dev/null || true
+  printf 'SANDBOXD_SRC_DIR=%s\n' "$REPO_ROOT" >> "$tmp"; mv "$tmp" .env
+fi
+$DOCKER build -q -t "sandboxd-upgrader:${SANDBOXD_VERSION}" image/upgrader >/dev/null && {
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"; grep -vE '^SANDBOXD_UPGRADER_IMAGE=' .env > "$tmp" 2>/dev/null || true
+  printf 'SANDBOXD_UPGRADER_IMAGE=sandboxd-upgrader:%s\n' "$SANDBOXD_VERSION" >> "$tmp"; mv "$tmp" .env; } && ok "upgrader image: sandboxd-upgrader:${SANDBOXD_VERSION}"
 export SANDBOXD_GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 bold "Building the control plane${CONSOLE:+ + console} and starting the stack…"
 $COMPOSE $PROFILE_ARGS build
@@ -174,17 +222,24 @@ ok "stack is up"
 chmod +x console-login.sh 2>/dev/null || true   # so `./console-login.sh` always runs
 
 # ── summary ──────────────────────────────────────────────────────────
+STAGE=done
 API_BIND="${SANDBOXD_API_BIND:-127.0.0.1:9090}"
 HTTP_PORT="${HTTP_PORT:-80}"
 PREVIEW_DOMAIN="${PREVIEW_DOMAIN:-localhost}"
+CONSOLE_HOST="${CONSOLE_HOST:-console.${PREVIEW_DOMAIN}}"
 PORTSUFFIX=""; [ "$HTTP_PORT" != "80" ] && PORTSUFFIX=":$HTTP_PORT"
+# Preview host shape, mirroring PREVIEW_HOST_STYLE / PREVIEW_HOST_TAG.
+PREVIEW_SUFFIX=".preview.${PREVIEW_DOMAIN}"
+if [ "${PREVIEW_HOST_STYLE:-nested}" = "flat" ]; then
+  PREVIEW_SUFFIX="${PREVIEW_HOST_TAG:+--$PREVIEW_HOST_TAG}.${PREVIEW_DOMAIN}"
+fi
 
 echo
 bold "sandboxd is running 🎉"
 cat <<EOF
 
   Control-plane API : http://${API_BIND}   (auth required — use your API key)
-  Preview URLs      : http://s-<id>-<port>.preview.${PREVIEW_DOMAIN}${PORTSUFFIX}
+  Preview URLs      : http://s-<id>-<port>${PREVIEW_SUFFIX}${PORTSUFFIX}
 
   Create your first sandbox (exposing a dev server on port 3000):
 
@@ -193,7 +248,7 @@ cat <<EOF
       -H 'content-type: application/json' \\
       -d '{"id":"demo01","ports":[3000]}' | tee /dev/stderr
 
-  Then open:  http://s-demo01-3000.preview.${PREVIEW_DOMAIN}${PORTSUFFIX}
+  Then open:  http://s-demo01-3000${PREVIEW_SUFFIX}${PORTSUFFIX}
 
   Logs:   $COMPOSE logs -f sandboxd
   Stop:   $COMPOSE down
@@ -204,7 +259,7 @@ EOF
 if [ "$CONSOLE" = "1" ]; then
   echo
   bold "Web console — open this first 👇"
-  printf '\n  Open    : http://console.%s%s\n' "$PREVIEW_DOMAIN" "$PORTSUFFIX"
+  printf '\n  Open    : http://%s%s\n' "$CONSOLE_HOST" "$PORTSUFFIX"
   printf '  Login   : create your password on first visit (change it anytime in Settings)\n'
   printf '  Then connect an agent in Settings, create an app, and build.\n'
 fi
@@ -215,7 +270,10 @@ if [ -n "$API_KEY" ]; then
   printf '  Send it as:  Authorization: Bearer <key>   (rotate in .env or the console)\n'
 fi
 printf '\n  Lost these later?  run:  ./console-login.sh\n'
+printf '  Forgot the console password later?  ./console-login.sh --reset-password\n'
 printf '  Update later:      run:  ./upgrade.sh   (backs up first, auto-rollback)\n'
+printf '  Public URL:        previews on %s only work from this network / plain HTTP.\n' "$PREVIEW_DOMAIN"
+printf '                     https://you.sandboxd.io in one command: https://sandboxd.io/cloud  ·  or your own domain: https://sandboxd.io/guides/production-tls\n'
 chmod +x upgrade.sh 2>/dev/null || true
 
 # A single, plain (no-color) nudge — suppress with SANDBOXD_NO_SPONSOR=1.

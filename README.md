@@ -38,25 +38,35 @@
 
 <p align="center"><b>Prompt → a real, running app on <i>your</i> server, at its own URL.</b><br/>See it in action 👇</p>
 
-<h3 align="center">1&nbsp;·&nbsp;Build an app from a prompt — in the console</h3>
-<p align="center"><i>Describe what you want; a coding agent builds it inside an isolated sandbox and it appears at a live preview URL.</i></p>
+<div align="center">
+<table>
+  <tr>
+    <td width="50%"><img alt="Build an app from a prompt in the sandboxd console" src="https://github.com/user-attachments/assets/582f5c46-af57-41c1-b9ed-4081d1075c51"><br><sub><b>1 · Build from a prompt</b> — an agent builds it in an isolated sandbox, live at a preview URL.</sub></td>
+    <td width="50%"><img alt="Run an existing open-source app (n8n) in sandboxd" src="https://github.com/user-attachments/assets/a89b03c9-0f4d-4b19-b190-ecd27dd10d10"><br><sub><b>2 · Or run an existing app</b> — n8n, Ghost, Grafana… 80+ curated apps, one click.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img alt="Drive sandboxd from the API / CLI" src="https://github.com/user-attachments/assets/0854fbd6-6801-42e3-bb42-55f8a4f9ead7"><br><sub><b>3 · Or drive the API</b> — every action is a <code>/v1</code> call, headless &amp; scriptable.</sub></td>
+    <td width="50%" align="center"><br><b>▶ <a href="https://sandboxd.io/demo/">Try the live demo</a></b><br><br><sub>Click around a real console with sample data — no install.</sub></td>
+  </tr>
+</table>
+</div>
+
+---
+
+<h3 align="center">📣 Stay in the loop</h3>
+
 <p align="center">
-  <img width="900" alt="Create a blog from a prompt in the sandboxd console" src="https://github.com/user-attachments/assets/582f5c46-af57-41c1-b9ed-4081d1075c51" />
+  Self-hosting is <b>MIT and free, forever</b> — <code>git clone</code> and you're done.<br/>
+  Want the <b>1.0 release + occasional product updates</b>, or a <b>managed cloud</b> so you don't run the box yourself? Two links:
 </p>
 
-<h3 align="center">2&nbsp;·&nbsp;Or launch an existing open-source app — one click</h3>
-<p align="center"><i>n8n, Ghost, Grafana, Gitea… 80+ curated apps, installed and live at their own URL.</i></p>
 <p align="center">
-  <img width="900" alt="Run an existing open-source app (n8n) in sandboxd" src="https://github.com/user-attachments/assets/a89b03c9-0f4d-4b19-b190-ecd27dd10d10" />
+  <a href="https://sandboxd.io/?news=1"><img alt="Get 1.0 + release news" src="https://img.shields.io/badge/%F0%9F%93%AC%20Get%201.0%20%2B%20release%20news-subscribe-0a0a0a?style=for-the-badge"></a>
+  &nbsp;
+  <a href="https://sandboxd.io/?waitlist=cloud"><img alt="sandboxd Cloud waitlist" src="https://img.shields.io/badge/%E2%98%81%EF%B8%8F%20sandboxd%20Cloud-join%20the%20waitlist-ff6b00?style=for-the-badge"></a>
 </p>
 
-<h3 align="center">3&nbsp;·&nbsp;Prefer code? Drive it all from the API / CLI</h3>
-<p align="center"><i>Every action is a <code>/v1</code> call — headless, scriptable, and easy to build into your own product.</i></p>
-<p align="center">
-  <img width="900" alt="Drive sandboxd from the API / CLI" src="https://github.com/user-attachments/assets/0854fbd6-6801-42e3-bb42-55f8a4f9ead7" />
-</p>
-
-<p align="center"><b>▶ <a href="https://sandboxd.io/demo/">Try the live demo</a></b> — click around a real console with sample data, no install.</p>
+<p align="center"><sub>No spam, one-click unsubscribe, and the cloud is <b>optional</b> — the self-hosted engine is always the full product.</sub></p>
 
 ---
 
@@ -184,6 +194,10 @@ sandboxd needs one Linux server with Docker — nothing else. Grab a server
 below (2 vCPU / 4 GB is plenty to start), paste our
 [cloud-init file](deploy/cloud-init.yaml) at creation, and it installs itself.
 
+> **Disclosure:** we earn a referral commission when you sign up through the
+> provider links below, at no additional cost to you. It helps fund sandboxd's
+> development.
+
 [![Deploy on Vultr](https://img.shields.io/badge/Deploy%20on-Vultr-007BFC?logo=vultr&logoColor=white&style=for-the-badge)](https://www.vultr.com/?ref=9912150)
 
 <!-- ENABLE THESE AS EACH AFFILIATE LINK ARRIVES (uncomment + replace placeholder):
@@ -200,9 +214,6 @@ curl -fsSL https://raw.githubusercontent.com/tastyeffectco/sandboxd/main/deploy/
 ```
 
 Full per-provider walkthrough: [deploy/DEPLOY.md](deploy/DEPLOY.md).
-
-> *Some links above are referral links — they cost you nothing and support
-> sandboxd's development.*
 
 ## What you get
 
@@ -227,6 +238,16 @@ environments, or team multi-app hosting.
 **❌ Skip it** if you just need one or two containers for yourself — a shell
 script or `docker run` is simpler.
 ([Why not just a script?](https://sandboxd.io/what-is-sandboxd))
+
+## Get a public URL — sandboxd Cloud
+
+Out of the box, previews live on `<ip>.sslip.io` or `localhost`: fine on your
+network, useless for sharing. **[sandboxd Cloud](https://sandboxd.io/cloud)**
+gives the server you already run `https://you.sandboxd.io` (console, API and
+`*.preview.you.sandboxd.io`) in one command — no domain, DNS, open ports or
+certificates, and it works behind NAT, on a laptop, or on a $5 VPS. Your
+compute and data stay on your machine. $9.99/server/month, 50% off at launch.
+Prefer your own domain? [Production / TLS](https://sandboxd.io/guides/production-tls).
 
 ## Managed — we run it for you
 
@@ -265,7 +286,7 @@ copy-pasteable runbook.
 Stars are how other builders find sandboxd — it's the fastest way to support the
 project (and it keeps us going). Thank you 🙏
 
-[![Star History Chart](https://api.star-history.com/svg?repos=tastyeffectco/sandboxd&type=Date)](https://star-history.com/#tastyeffectco/sandboxd&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=tastyeffectco/sandboxd&type=Date)](https://star-history.dera.page/#tastyeffectco/sandboxd&type=Date)
 
 ## License
 
