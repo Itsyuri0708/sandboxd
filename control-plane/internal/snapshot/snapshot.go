@@ -1,15 +1,15 @@
 // Package snapshot implements the Phase 7 workspace snapshot / restore
 // subsystem: zstd-compressed point-in-time copies of a sandbox's
 // loopback `.img`, an hourly auto-snapshotter for sandboxes idle ≥
-// 24 h (the "Snapshotted" row from CLAUDE.md's idle-lifecycle table),
+// 24 h (the "Snapshotted" state in the idle-lifecycle model),
 // a retention pruner, and a restore path.
 //
 // roadmap/phase-7-monitoring-snapshots-and-ops.md §9–§10.
 //
 // Layout on disk:
 //
-//	/var/lib/sandboxed/_snapshots/<id>/<YYYY-MM-DD-HHMMSS>.img.zst
-//	/var/lib/sandboxed/_snapshots/<id>/<YYYY-MM-DD-HHMMSS>.json   (sidecar)
+//	/var/lib/sandboxd/_snapshots/<id>/<YYYY-MM-DD-HHMMSS>.img.zst
+//	/var/lib/sandboxd/_snapshots/<id>/<YYYY-MM-DD-HHMMSS>.json   (sidecar)
 //
 // Every snapshot is written `.tmp` then atomically renamed; a partial
 // `.tmp` left by a crash is swept by the reconciler on next boot.
@@ -36,8 +36,8 @@ const tsLayout = "2006-01-02-150405"
 
 // Manager owns the snapshot subsystem's configuration + collaborators.
 type Manager struct {
-	WorkspacesRoot string        // /var/lib/sandboxed/workspaces
-	SnapshotsRoot  string        // /var/lib/sandboxed/_snapshots
+	WorkspacesRoot string        // /var/lib/sandboxd/workspaces
+	SnapshotsRoot  string        // /var/lib/sandboxd/_snapshots
 	RetentionDays  int           // SANDBOXD_SNAPSHOT_RETENTION_DAYS (7)
 	IdleThreshold  time.Duration // auto-snapshot a stopped sandbox once idle this long (24h)
 
@@ -97,8 +97,8 @@ func (m *Manager) imgExists(id string) bool {
 }
 
 // List returns the snapshots on disk for id, newest first. It does
-// NOT consult the DB — roadmap §9: "Operates against
-// _snapshots/<id>/ directly ... Does not require a sandbox row."
+// NOT consult the DB — it operates against _snapshots/<id>/
+// directly and does not require a sandbox row.
 // Returns an empty slice if the directory is absent or empty.
 func (m *Manager) List(id string) ([]Entry, error) {
 	entries, err := os.ReadDir(m.dir(id))

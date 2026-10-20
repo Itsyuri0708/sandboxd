@@ -5,6 +5,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
@@ -14,7 +15,7 @@ import (
 )
 
 // handleForwardAuth is called by Traefik's forwardAuth middleware on
-// every request to a private sandbox (roadmap §8). A 2xx response
+// every request to a private sandbox. A 2xx response
 // means allow; the deny path is a 302 (or, with
 // SANDBOXD_FORWARD_AUTH_DENY_MODE=meta-refresh, a 401 + <meta refresh>
 // fallback) to the upstream auth URL. Reachable externally without the
@@ -29,9 +30,10 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 	fwdHost := r.Header.Get("X-Forwarded-Host")
 	fwdURI := r.Header.Get("X-Forwarded-Uri")
 
-	id := parseSandboxIDFromHost(fwdHost, s.PreviewDomain)
+	hs := s.hosts()
+	id := parseSandboxIDFromHost(fwdHost, hs)
 	if id == "" {
-		// Unparseable host — deny, no redirect (roadmap §8 step 1).
+		// Unparseable host — deny, no redirect.
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -45,11 +47,18 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Public sandboxes should never route through forward-auth; allow
-	// as a no-op safety net (roadmap §8 step 2).
+	// as a no-op safety net.
 	if sb.Visibility != "private" {
 		metrics.PreviewAccess.WithLabelValues("allowed").Inc()
 		w.WriteHeader(http.StatusOK)
 		return
+	}
+
+	if hs.Flat() {
+		if u, perr := url.ParseRequestURI(fwdURI); perr == nil && u.Path == flatAuthLandingPath {
+			s.handleFlatAuthLanding(w, r, id, fwdHost, u.Query())
+			return
+		}
 	}
 
 	ownerUID := ""
@@ -92,8 +101,7 @@ func (s *Server) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
 // forwardAuthDeny issues the deny response. Primary strategy: a 302 to
 // the upstream auth URL. SANDBOXD_FORWARD_AUTH_DENY_MODE=meta-refresh
 // switches to the documented 401 + <meta refresh> fallback for Traefik
-// builds that do not pass 3xx from the auth service through cleanly
-// (roadmap §8 / §Risks "Traefik forward-auth 3xx passthrough").
+// builds that do not pass 3xx from the auth service through cleanly.
 func (s *Server) forwardAuthDeny(w http.ResponseWriter, r *http.Request, id, fwdHost, fwdURI string) {
 	cfg := s.authCfg()
 	returnURL := "https://" + fwdHost + fwdURI
@@ -101,7 +109,13 @@ func (s *Server) forwardAuthDeny(w http.ResponseWriter, r *http.Request, id, fwd
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	target := auth.BuildRedirectURL(cfg.AuthRedirectURL, id, returnURL)
+	s.forwardAuthRedirect(w, r, auth.BuildRedirectURL(cfg.AuthRedirectURL, id, returnURL))
+}
+
+// forwardAuthRedirect sends the browser to target from inside a
+// forward-auth response: a 302, or the 401 + <meta refresh> form when
+// SANDBOXD_FORWARD_AUTH_DENY_MODE=meta-refresh.
+func (s *Server) forwardAuthRedirect(w http.ResponseWriter, r *http.Request, target string) {
 	if s.ForwardAuthDenyMode == "meta-refresh" {
 		w.Header().Set("Location", target)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

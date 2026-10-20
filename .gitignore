@@ -25,3 +25,12 @@
 docker-compose.override.yml
 /abs-manifest.yaml
 /gitea.yaml
+
+# generated console login (plaintext, local only)
+.console-login
+
+# internal maintainer docs — kept locally, never published
+docs/internal/
+.env.bak*
+*.env.bak*
+.env.*.bak

@@ -1,10 +1,12 @@
-// Package api wires the HTTP handlers. CLAUDE.md control-plane scope:
-// "Binds to 127.0.0.1 only. No auth in v1 (introduced in Phase 8)."
-// The phase-4 listener default is 127.0.0.1:8080.
+// Package api wires the HTTP handlers. Auth is enforced by the
+// internal/auth middleware, applied around this mux in main.go.
 package api
 
 import (
+	"bufio"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -25,13 +27,18 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/secrets"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/telemetry"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/upgrade"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/wake"
 )
 
 // Server bundles the collaborators the handlers need.
 type Server struct {
-	Store         *store.Store
-	Docker        *docker.Client
+	Store  *store.Store
+	Docker *docker.Client
+	// Upgrade runs in-place upgrades via a detached upgrader container
+	// (POST /v1/upgrade). nil = feature unavailable (returns 409 with CLI hint).
+	Upgrade       *upgrade.Manager
 	Loopback      *loopback.Manager
 	Log           *slog.Logger
 	PreviewDomain string
@@ -49,8 +56,17 @@ type Server struct {
 	//                        portable build (the --memory ceiling still applies).
 	Network           string
 	Userns            string
+	Runtime           string
+	DNSResolvConf     string
 	PreviewEntrypoint string
 	PreviewTLS        bool
+	// PreviewURLScheme forces the scheme of generated preview URLs ("http" or
+	// "https") independently of PreviewTLS — for sandboxd behind something
+	// else that terminates TLS (Cloudflare Tunnel, Caddy, a reverse tunnel):
+	// Traefik keeps serving plain HTTP, but the console must hand out https://
+	// URLs or it cannot iframe previews (mixed content). Empty = derive from
+	// PreviewTLS, exactly the previous behaviour.
+	PreviewURLScheme string
 	// PublicHTTPPort is the HOST-facing port that preview/console URLs are
 	// reached on (the host side of Traefik's published port). previewURL
 	// appends it unless it's the default for the scheme (80 for http, 443
@@ -58,6 +74,11 @@ type Server struct {
 	// a reachable ":18080" URL instead of a bare :80 one. Empty = default.
 	PublicHTTPPort string
 	SetMemoryHigh  bool
+	// PreviewHostStyle / PreviewHostTag lay out preview, console and API
+	// hostnames under PreviewDomain (PREVIEW_HOST_STYLE / PREVIEW_HOST_TAG,
+	// see package previewhost). Empty style = nested, today's layout.
+	PreviewHostStyle string
+	PreviewHostTag   string
 
 	// GitPush runs the host-side git read+push ops (B2). Nil in production →
 	// the handler uses the real gitimport.Runner; tests inject a fake.
@@ -75,14 +96,13 @@ type Server struct {
 	// sandbox's on-workspace files exactly once after a change.
 
 	// TemplatesDir is the host directory holding prebuilt golden
-	// template .img files for the fast-cold-start path
-	// (ops/design/fast-coldstart-react-vite-snapshot.md). Empty
+	// template .img files for the fast-cold-start path. Empty
 	// disables the optional `template` field on POST /sandbox.
 	TemplatesDir string
 
 	// LibraryRoot is the host directory holding user-created snapshot
-	// images (ops/design/snapshots-as-templates.md) —
-	// /var/lib/sandboxed/library/<snapshot_id>.img. Independent of
+	// images —
+	// /var/lib/sandboxd/library/<snapshot_id>.img. Independent of
 	// _snapshots/ (the Phase 7 auto-snapshot tree) so the retention
 	// pruner and per-sandbox purge never touch templates. Empty disables
 	// the /v1/snapshots endpoints (503).
@@ -125,6 +145,10 @@ type Server struct {
 	// Phase 8A — static, safe instance metadata for GET /v1/settings.
 	// Populated in main; contains no secrets.
 	Instance InstanceInfo
+
+	// Update is the best-effort release checker (internal/telemetry). nil-safe:
+	// when unset, GET /v1/settings simply reports update_available=false.
+	Update *telemetry.Checker
 
 	// Phase 8B — live, runtime-editable lifecycle tunables (idle/keepalive),
 	// shared with the reaper. nil-safe: PATCH /v1/settings returns 503 when
@@ -211,6 +235,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandbox/{id}/restore", s.observe("POST /sandbox/{id}/restore", s.handleSnapshotRestore))
 	mux.HandleFunc("GET /llm.txt", s.observe("GET /llm.txt", s.handleLLMTxt))
 	mux.HandleFunc("GET /healthz", s.observe("GET /healthz", s.handleHealthz))
+	mux.HandleFunc("GET /version", s.observe("GET /version", s.handleVersion))
 	mux.HandleFunc("GET /readyz", s.observe("GET /readyz", s.handleReadyz))
 	mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
@@ -222,7 +247,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /preview-auth", s.observe("GET /preview-auth", s.handlePreviewAuth))
 	mux.HandleFunc("GET /forward-auth", s.observe("GET /forward-auth", s.handleForwardAuth))
 
-	// Public v1 API (ops/design/v1-external-api.md) — a narrow
+	// Public v1 API — a narrow
 	// translation layer over the internal machinery + runtimed.
 	mux.HandleFunc("POST /v1/sandboxes", s.observe("POST /v1/sandboxes", s.v1CreateSandbox))
 	mux.HandleFunc("GET /v1/sandboxes/{id}", s.observe("GET /v1/sandboxes/{id}", s.v1GetSandbox))
@@ -240,6 +265,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/sandboxes/{id}/files", s.observe("PUT /v1/sandboxes/{id}/files", s.v1PutFile))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/export", s.observe("GET /v1/sandboxes/{id}/export", s.v1Export))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/processes/{name}/logs", s.observe("GET /v1/sandboxes/{id}/processes/{name}/logs", s.v1ProcessLogs))
+	mux.HandleFunc("GET /v1/sandboxes/{id}/terminal", s.observe("GET /v1/sandboxes/{id}/terminal", s.v1Terminal))
 
 	// Durable apps above sandboxes (Phase 1).
 	mux.HandleFunc("GET /v1/settings", s.observe("GET /v1/settings", s.v1GetSettings))
@@ -254,6 +280,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/git-credentials", s.observe("POST /v1/git-credentials", s.v1CreateGitCredential))
 	mux.HandleFunc("GET /v1/git-credentials", s.observe("GET /v1/git-credentials", s.v1ListGitCredentials))
 	mux.HandleFunc("DELETE /v1/git-credentials/{id}", s.observe("DELETE /v1/git-credentials/{id}", s.v1DeleteGitCredential))
+
+	// Console auth — the control plane is the login authority. status/login/setup
+	// are exempt from the auth middleware (see internal/auth/middleware.go).
+	mux.HandleFunc("GET /v1/upgrade", s.observe("GET /v1/upgrade", s.v1UpgradeStatus))
+	mux.HandleFunc("POST /v1/upgrade", s.observe("POST /v1/upgrade", s.v1UpgradeStart))
+	mux.HandleFunc("GET /v1/auth/status", s.observe("GET /v1/auth/status", s.v1AuthStatus))
+	mux.HandleFunc("POST /v1/auth/setup", s.observe("POST /v1/auth/setup", s.v1AuthSetup))
+	mux.HandleFunc("POST /v1/auth/login", s.observe("POST /v1/auth/login", s.v1AuthLogin))
+	mux.HandleFunc("POST /v1/auth/logout", s.observe("POST /v1/auth/logout", s.v1AuthLogout))
+	mux.HandleFunc("POST /v1/auth/password", s.observe("POST /v1/auth/password", s.v1AuthPassword))
+	mux.HandleFunc("DELETE /v1/auth/password", s.observe("DELETE /v1/auth/password", s.v1AuthPasswordReset))
+	mux.HandleFunc("GET /v1/api-keys", s.observe("GET /v1/api-keys", s.v1ListAPIKeys))
+	mux.HandleFunc("POST /v1/api-keys", s.observe("POST /v1/api-keys", s.v1CreateAPIKey))
+	mux.HandleFunc("DELETE /v1/api-keys/{id}", s.observe("DELETE /v1/api-keys/{id}", s.v1DeleteAPIKey))
 	mux.HandleFunc("POST /v1/apps", s.observe("POST /v1/apps", s.v1CreateApp))
 	mux.HandleFunc("GET /v1/apps", s.observe("GET /v1/apps", s.v1ListApps))
 	mux.HandleFunc("GET /v1/apps/{id}", s.observe("GET /v1/apps/{id}", s.v1GetApp))
@@ -278,7 +318,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/apps/{id}/config/{key}", s.observe("PATCH /v1/apps/{id}/config/{key}", s.v1PatchAppConfig))
 	mux.HandleFunc("DELETE /v1/apps/{id}/config/{key}", s.observe("DELETE /v1/apps/{id}/config/{key}", s.v1DeleteAppConfig))
 
-	// Snapshots-as-templates (ops/design/snapshots-as-templates.md).
+	// Snapshots-as-templates.
 	mux.HandleFunc("POST /v1/snapshots", s.observe("POST /v1/snapshots", s.v1CreateSnapshot))
 	mux.HandleFunc("GET /v1/snapshots", s.observe("GET /v1/snapshots", s.v1ListSnapshots))
 	mux.HandleFunc("GET /v1/snapshots/{id}", s.observe("GET /v1/snapshots/{id}", s.v1GetSnapshot))
@@ -317,6 +357,16 @@ func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack forwards to the wrapped writer so a WebSocket upgrade (the in-sandbox
+// terminal) can take over the connection. Without it this wrapper hides
+// http.Hijacker and the upgrade fails.
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, errors.New("ResponseWriter does not support hijacking")
 }
 
 func statusBucket(code int) string {

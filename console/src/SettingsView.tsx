@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, ReactNode } from 'react'
-import { api, Settings as TSettings, Agent, GitCredential } from './api'
+import { api, Settings as TSettings, Agent, GitCredential, ApiKey } from './api'
 import { c, font, mono, Card, H, Btn, Pill, Input } from './design/kit'
+import { ApiKeyRow, ApiKeyAccessSelect, KeyAccess, accessScopes } from './ApiKeys'
 
 // --- source badges: every value on this page is one of these ----------------
 // editable  → change it here, saved live via PATCH /v1/settings
@@ -45,16 +46,25 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
   const [keepSec, setKeepSec] = useState(0)
   const [gc, setGc] = useState({ name: '', host: '', username: '', token: '' })
   const [showPrompt, setShowPrompt] = useState(false)
+  const [curPw, setCurPw] = useState('')
+  const [newPw, setNewPw] = useState('')
+  const [keys, setKeys] = useState<ApiKey[]>([])
+  const [keyName, setKeyName] = useState('')
+  const [keyAccess, setKeyAccess] = useState<KeyAccess>('')
+  const [newKey, setNewKey] = useState('')
+  const [models, setModels] = useState<Record<string, string>>({})
 
   const loadAgents = useCallback(() => api.getAgents().then(setAgents).catch(() => {}), [])
   const loadCreds = useCallback(() => api.listGitCredentials().then(setCreds).catch(() => {}), [])
+  const loadKeys = useCallback(() => api.listApiKeys().then(setKeys).catch(() => {}), [])
   useEffect(() => {
-    api.getSettings().then((d) => { setS(d); setIdle(d.lifecycle.idle_reap_enabled); setIdleSec(d.lifecycle.idle_threshold_seconds); setKeepSec(d.lifecycle.keepalive_max_seconds) }).catch((e) => onError((e as Error).message))
-    loadAgents(); loadCreds()
-  }, [onError, loadAgents, loadCreds])
+    api.getSettings().then((d) => { setS(d); setIdle(d.lifecycle.idle_reap_enabled); setIdleSec(d.lifecycle.idle_threshold_seconds); setKeepSec(d.lifecycle.keepalive_max_seconds); setModels(d.agents.default_models || {}) }).catch((e) => onError((e as Error).message))
+    loadAgents(); loadCreds(); loadKeys()
+  }, [onError, loadAgents, loadCreds, loadKeys])
 
   if (!s) return <div style={{ padding: 40, color: c.muted2 }}>Loading…</div>
   const lifecycleEditable = (s.editable || []).some((p) => p.startsWith('lifecycle.'))
+  const modelsEditable = (s.editable || []).some((p) => p === 'agents.default_models')
 
   const connectClaude = async () => {
     try { const r = await api.oauthStart('claude-code'); window.open(r.authorize_url, '_blank'); const code = window.prompt('Approve in the opened tab, then paste the code here:'); if (code) { await api.oauthFinish('claude-code', code.trim()); toast('Claude connected'); loadAgents() } } catch (e) { onError((e as Error).message) }
@@ -62,7 +72,12 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
   const apiKey = async (id: string) => { const key = window.prompt(`Paste the ${id} API key:`); if (key) try { await api.setAgentApiKey(id, key.trim()); toast('Connected'); loadAgents() } catch (e) { onError((e as Error).message) } }
   const importCred = async (id: string) => { const v = window.prompt(`Paste the credential (from your ${id} login):`); if (v) try { await api.importAgentCredential(id, v); toast('Connected'); loadAgents() } catch (e) { onError((e as Error).message) } }
   const saveLifecycle = async () => { try { await api.patchSettings({ lifecycle: { idle_reap_enabled: idle, idle_threshold_seconds: idleSec, keepalive_max_seconds: keepSec } }); toast('Lifecycle saved') } catch (e) { onError((e as Error).message) } }
+  const saveModels = async () => { try { const d = await api.patchSettings({ agents: { default_models: models } }); setModels(d.agents.default_models || {}); toast('Default models saved') } catch (e) { onError((e as Error).message) } }
   const addCred = async () => { if (!gc.name || !gc.host || !gc.token) return; try { await api.createGitCredential(gc); setGc({ name: '', host: '', username: '', token: '' }); toast('Credential added'); loadCreds() } catch (e) { onError((e as Error).message) } }
+  const changePw = async () => { if (!curPw || !newPw) return; try { await api.changePassword({ current_password: curPw, new_password: newPw }); setCurPw(''); setNewPw(''); toast('Password changed') } catch (e) { onError((e as Error).message) } }
+  const signOutEverywhere = async () => { try { await api.logoutEverywhere(); location.reload() } catch (e) { onError((e as Error).message) } }
+  const createKey = async () => { if (!keyName.trim()) return; try { const k = await api.createApiKey(keyName.trim(), accessScopes(keyAccess)); setNewKey(k.key); setKeyName(''); setKeyAccess(''); loadKeys() } catch (e) { onError((e as Error).message) } }
+  const copyKey = () => { navigator.clipboard?.writeText(newKey).then(() => toast('Copied')).catch(() => {}) }
 
   const legendItem = (badge: ReactNode, text: string) => (
     <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>{badge}<span style={{ fontSize: 11.5, color: c.muted }}>{text}</span></div>
@@ -89,12 +104,15 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
           {agents.map((a) => {
             // Codex is disabled for now — its ChatGPT-subscription auth can't be
             // put behind the credential proxy yet (see the note below).
+            // MiniMax is a credential-only provider (no task-agent CLI); it's
+            // connectable here but never appears in the run picker.
             const disabled = a.id === 'codex'
+            const credentialOnly = !a.runnable && a.id !== 'codex'
             return (
             <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', border: `1px solid ${c.border}`, borderRadius: 8, background: c.panel2, marginBottom: 8, opacity: disabled ? 0.6 : 1 }} data-testid={`agent-${a.id}`}>
               <div>
                 <div style={{ fontWeight: 500 }}>{a.label}</div>
-                <div style={{ ...mono, fontSize: 11, color: c.muted2 }}>{disabled ? 'temporarily unavailable' : `${a.installed_state === 'installed' ? 'installed' : 'not installed'}${a.status === 'connected' && a.method ? ` · via ${a.method === 'oauth' ? 'subscription' : 'API key'}` : ''}`}</div>
+                <div style={{ ...mono, fontSize: 11, color: c.muted2 }}>{disabled ? 'temporarily unavailable' : `${a.installed_state === 'installed' ? 'installed' : 'not installed'}${a.status === 'connected' && a.method ? ` · via ${a.method === 'oauth' ? 'subscription' : 'API key'}` : ''}${credentialOnly ? ' · model gateway' : ''}`}</div>
               </div>
               {disabled ? (
                 <span style={{ marginLeft: 'auto' }}><Pill tone="neutral">disabled</Pill></span>
@@ -112,7 +130,28 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
             </div>
           )})}
         </div>
-        <div style={{ color: c.muted2, fontSize: 12, lineHeight: 1.5 }}>Each agent runs on your own account; credentials are stored opaquely server-side, never shown in the browser, and kept out of snapshots. <b style={{ color: c.fg2 }}>Claude Code</b> subscriptions run through a credential-injecting proxy — the token never enters the sandbox. <b style={{ color: c.fg2 }}>Codex is disabled for now</b>: its ChatGPT-subscription auth uses a WebSocket backend that can't yet be put behind that proxy, and we won't mount a raw token into the sandbox.</div>
+
+        {/* Optional per-agent default model. The user supplies the real provider
+            model id; it's used when a task doesn't pick one. */}
+        <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${c.border}` }} data-testid="settings-agent-models">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <H style={{ fontSize: 13 }}>Default model</H>
+            <Src kind={modelsEditable ? 'editable' : undefined} env={modelsEditable ? undefined : 'SANDBOXD_OPENCODE_MODEL'} />
+            <span style={{ marginLeft: 'auto', fontSize: 11.5, color: c.muted2 }}>optional — used when a task doesn't pick a model</span>
+          </div>
+          <div style={{ color: c.muted2, fontSize: 12, lineHeight: 1.5, marginBottom: 10 }}>Paste each agent's own model id (e.g. OpenCode <span style={{ ...mono, fontSize: 11 }}>glm-5</span>, Claude <span style={{ ...mono, fontSize: 11 }}>sonnet</span>). Leave blank for the agent's default — OpenCode with no API key falls back to its free tier (<span style={{ ...mono, fontSize: 11 }}>big-pickle</span>).</div>
+          {agents.filter((a) => a.id !== 'codex' && a.runnable).map((a) => (
+            <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+              <span style={{ width: 130, fontSize: 12.5, color: c.muted }}>{a.label}</span>
+              <Input mono value={models[a.id] || ''} onChange={(e) => setModels({ ...models, [a.id]: e.target.value })} disabled={!modelsEditable} placeholder={a.id === 'opencode' ? 'big-pickle (free tier)' : 'agent default'} style={{ width: 260 }} data-testid={`agent-model-${a.id}`} />
+            </div>
+          ))}
+          {modelsEditable
+            ? <Btn onClick={saveModels} style={{ marginTop: 8 }} data-testid="save-agent-models">Save default models</Btn>
+            : <div style={{ marginTop: 8, fontSize: 12, color: c.muted2 }}>Read-only on this instance — set <span style={{ ...mono, fontSize: 11 }}>SANDBOXD_OPENCODE_MODEL</span> (opencode) or per-task model.</div>}
+        </div>
+
+        <div style={{ color: c.muted2, fontSize: 12, lineHeight: 1.5, marginTop: 14 }}>Each agent runs on your own account; credentials are stored opaquely server-side, never shown in the browser, and kept out of snapshots. <b style={{ color: c.fg2 }}>OpenCode</b> works out of the box with <b style={{ color: c.fg2 }}>no key</b> on its free tier — add an API key for the full model catalog. <b style={{ color: c.fg2 }}>Claude Code</b> subscriptions run through a credential-injecting proxy — the token never enters the sandbox. <b style={{ color: c.fg2 }}>Codex is disabled for now</b>: its ChatGPT-subscription auth uses a WebSocket backend that can't yet be put behind that proxy, and we won't mount a raw token into the sandbox.</div>
       </Card>
 
       <Card style={{ padding: 16, marginBottom: 12 }} data-testid="settings-lifecycle">
@@ -155,6 +194,39 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
         </div>
       </Card>
 
+      <Card style={{ padding: 16, marginTop: 12 }} data-testid="settings-security">
+        <H style={{ marginBottom: 6 }}>Security</H>
+        <div style={{ color: c.muted, fontSize: 12.5, marginBottom: 12 }}>Change the console password, or sign out every session (clears the cookie everywhere).</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Input value={curPw} onChange={(e) => setCurPw(e.target.value)} placeholder="current password" type="password" style={{ width: 200, fontFamily: font.sans }} data-testid="security-current" />
+          <Input value={newPw} onChange={(e) => setNewPw(e.target.value)} placeholder="new password (min 8)" type="password" style={{ width: 200, fontFamily: font.sans }} data-testid="security-new" />
+          <Btn variant="primary" onClick={changePw} data-testid="security-change">Change password</Btn>
+          <Btn variant="danger" onClick={signOutEverywhere} style={{ marginLeft: 'auto' }} data-testid="security-signout">Sign out everywhere</Btn>
+        </div>
+      </Card>
+
+      <Card style={{ padding: 16, marginTop: 12 }} data-testid="settings-api-keys">
+        <H style={{ marginBottom: 6 }}>API keys</H>
+        <div style={{ color: c.muted, fontSize: 12.5, marginBottom: 12 }}>Programmatic access to the <span style={{ ...mono, fontSize: 11.5 }}>/v1</span> API. The full key is shown once at creation — store it somewhere safe.</div>
+        {keys.length === 0 && <div style={{ color: c.muted2, fontSize: 12, marginBottom: 8 }}>No API keys yet.</div>}
+        {keys.map((k) => <ApiKeyRow key={k.id} k={k} onRevoke={(id) => api.revokeApiKey(id).then(loadKeys)} />)}
+        {newKey && (
+          <div style={{ marginTop: 10, padding: '12px 14px', border: `1px solid ${c.good}40`, background: `${c.good}14`, borderRadius: 8 }} data-testid="api-key-new">
+            <div style={{ fontSize: 12, color: c.good, fontWeight: 600, marginBottom: 6 }}>Copy it now — it won't be shown again.</div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <Input mono readOnly value={newKey} onFocus={(e) => e.target.select()} style={{ flex: 1, fontSize: 11.5 }} data-testid="api-key-new-value" />
+              <Btn onClick={copyKey}>Copy</Btn>
+              <Btn variant="ghost" onClick={() => setNewKey('')}>Done</Btn>
+            </div>
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+          <Input value={keyName} onChange={(e) => setKeyName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && createKey()} placeholder="key name (ci, laptop…)" style={{ flex: 1, fontFamily: font.sans }} data-testid="api-key-name" />
+          <ApiKeyAccessSelect value={keyAccess} onChange={setKeyAccess} />
+          <Btn variant="primary" onClick={createKey} data-testid="api-key-create">Create key</Btn>
+        </div>
+      </Card>
+
       {/* ─────────────── INSTANCE CONFIGURATION (read-only) ─────────────── */}
       <SectionTitle note="fixed at deploy — the badge shows the env var to change each one">Instance configuration</SectionTitle>
 
@@ -168,6 +240,10 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
         <Field label="Preview domain" value={s.networking.preview_domain} env="PREVIEW_DOMAIN" />
         <Field label="Public HTTP port" value={s.networking.public_http_port || '—'} env="HTTP_PORT" />
         <Field label="Preview base" value={s.networking.preview_base} kind="derived" />
+        <Field label="Host style" value={s.networking.preview_host_style || 'nested'} env="PREVIEW_HOST_STYLE" />
+        {s.networking.preview_host_style === 'flat' && (
+          <Field label="Host tag" value={s.networking.preview_host_tag || '—'} env="PREVIEW_HOST_TAG" />
+        )}
         <Field label="TLS" value={<Pill tone={s.networking.preview_tls ? 'good' : 'warn'}>{s.networking.preview_tls ? 'enabled' : 'plain HTTP'}</Pill>} env="PREVIEW_TLS" />
         <Field label="Entrypoint" value={s.networking.preview_entrypoint || 'web'} env="PREVIEW_ENTRYPOINT" />
 

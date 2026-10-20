@@ -22,6 +22,25 @@ tags:
   - name: snapshots
 
 paths:
+  /version:
+    get:
+      operationId: getVersion
+      summary: Build version and commit (no auth; for monitoring and upgrade checks)
+      security: []
+      responses:
+        "200":
+          description: Build identity
+          headers:
+            Cache-Control:
+              schema: { type: string, example: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, commit]
+                properties:
+                  version: { type: string, example: v0.3.15 }
+                  commit: { type: string, example: 1a2b3c4d5e6f }
   /v1/settings:
     get:
       operationId: getSettings
@@ -36,10 +55,11 @@ paths:
     patch:
       operationId: updateSettings
       tags: [apps]
-      summary: Edit the runtime-editable lifecycle tunables only (allowlisted)
+      summary: Edit the runtime-editable settings (allowlisted)
       description: >
-        Accepts ONLY lifecycle tunables. Any other key (auth, egress, networking,
-        secrets, version, …) is rejected with 400. Persisted and hot-applied.
+        Accepts ONLY the allowlisted editable fields: lifecycle tunables and
+        agents.default_models. Any other key (auth, egress, networking, secrets,
+        version, …) is rejected with 400. Persisted and hot-applied.
       requestBody:
         required: true
         content:
@@ -53,6 +73,16 @@ paths:
                     idle_reap_enabled: { type: boolean }
                     idle_threshold_seconds: { type: integer }
                     keepalive_max_seconds: { type: integer }
+                agents:
+                  type: object
+                  properties:
+                    default_models:
+                      type: object
+                      additionalProperties: { type: string }
+                      description: >
+                        Per-agent default model id (agent -> model). Merges into the
+                        stored map; an empty value clears that agent's default. Only
+                        runnable agents are accepted.
       responses:
         "200":
           description: Updated settings.
@@ -122,6 +152,203 @@ paths:
       responses:
         "204": { description: Deleted }
         "404": { description: No such credential }
+
+  /v1/upgrade:
+    get:
+      summary: In-place upgrade status
+      description: State of the last/current in-place upgrade (survives the control-plane restart). `phase` is one of idle, running, succeeded, failed, rolled_back, unavailable.
+      responses:
+        "200":
+          description: Upgrade state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  phase: { type: string }
+                  target: { type: string }
+                  from: { type: string }
+                  started_at: { type: string }
+                  ended_at: { type: string }
+                  message: { type: string }
+                  log_tail: { type: string }
+    post:
+      summary: Start an in-place upgrade
+      description: Launches a detached upgrader container that runs `./upgrade.sh <target>` (backup, rebuild, restart, health check, auto-rollback). The console reconnects when the control plane restarts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target: { type: string, description: "A published release tag, e.g. v0.3.11" }
+      responses:
+        "202": { description: Upgrade started; body is the upgrade state }
+        "400": { description: Target is not a published release }
+        "409": { description: An upgrade is already running, or this install is not configured for in-place upgrades }
+        "507": { description: Less than 2 GB free in the data dir }
+  /v1/auth/status:
+    get:
+      operationId: authStatus
+      tags: [apps]
+      summary: Console auth status — is auth enabled, is the caller authenticated, is a password set (pre-login probe, no credential required)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  authenticated: { type: boolean }
+                  password_set: { type: boolean }
+  /v1/auth/setup:
+    post:
+      operationId: authSetup
+      tags: [apps]
+      summary: First-run — set the console password and start a session. 409 once a password is already set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, description: min 8 chars }
+      responses:
+        "204": { description: Password set; session cookie issued }
+        "400": { description: Password too short / invalid body }
+        "409": { description: A password is already set }
+  /v1/auth/login:
+    post:
+      operationId: authLogin
+      tags: [apps]
+      summary: Verify the console password and issue an HttpOnly session cookie
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        "204": { description: Authenticated; session cookie issued }
+        "401": { description: Invalid password }
+  /v1/auth/logout:
+    post:
+      operationId: authLogout
+      tags: [apps]
+      summary: Revoke the current session and clear the cookie
+      responses:
+        "204": { description: Logged out }
+  /v1/auth/password:
+    post:
+      operationId: authChangePassword
+      tags: [apps]
+      summary: Change the console password (requires a logged-in session); revokes all sessions and re-issues one
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, description: min 8 chars }
+      responses:
+        "204": { description: Password changed }
+        "400": { description: New password too short / invalid body }
+        "401": { description: Current password incorrect }
+        "403": { description: Not logged in as a console user }
+    delete:
+      operationId: authResetPassword
+      tags: [apps]
+      summary: Reset (forget) the console password so the next visit creates a new one; revokes every session. API-key callers only — a console session is refused.
+      responses:
+        "204": { description: Password cleared and all sessions revoked }
+        "401": { description: No credential }
+        "403": { description: Caller is a console session, not an API key }
+  /v1/api-keys:
+    post:
+      operationId: createApiKey
+      tags: [apps]
+      summary: Mint an API key (each = the shared tenant). The plaintext key is returned exactly once. Session-only.
+      description: |
+        `scopes` restricts what the key may call; omitted or empty = full access.
+        A key with scope `upgrade` may only call `GET/POST /v1/upgrade`, `GET /healthz`,
+        `GET /readyz`, `GET /version` and `GET /v1/auth/status` — every other route
+        returns 403 `forbidden`. Intended for external updaters.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, description: 1-64 printable chars }
+                scopes:
+                  type: array
+                  items: { type: string, enum: [upgrade] }
+                  description: Optional restriction; omitted = full access
+      responses:
+        "201":
+          description: Created — plaintext key returned once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  name: { type: string }
+                  prefix: { type: string }
+                  scopes: { type: array, items: { type: string } }
+                  key: { type: string, description: plaintext — shown only here }
+        "400": { description: Invalid name or unknown scope }
+        "403": { description: Requires a console login }
+        "409": { description: A key with that name already exists }
+    get:
+      operationId: listApiKeys
+      tags: [apps]
+      summary: List API keys (metadata only — never the key or its hash). Session-only.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+                        prefix: { type: string }
+                        created_at: { type: string }
+                        last_used_at: { type: string }
+                        scopes: { type: array, items: { type: string }, description: empty = full access }
+        "403": { description: Requires a console login }
+  /v1/api-keys/{id}:
+    delete:
+      operationId: revokeApiKey
+      tags: [apps]
+      summary: Revoke an API key. Session-only.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Revoked }
+        "403": { description: Requires a console login }
+        "404": { description: No such key }
 
   /v1/agents:
     get:
@@ -1201,6 +1428,24 @@ paths:
             application/zip:
               schema: { type: string, format: binary }
 
+  /v1/sandboxes/{id}/terminal:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    get:
+      operationId: sandboxTerminal
+      tags: [sandboxes]
+      summary: Interactive terminal (WebSocket)
+      description: >
+        Upgrades to a WebSocket and bridges an interactive shell running INSIDE
+        the sandbox (uid 1000, the app workspace) to a browser terminal. It runs
+        in the same container the coding agent executes in, so it adds no new
+        trust boundary. Frames: BINARY = keystrokes (client→server) and shell
+        output (server→client); a TEXT frame `{"resize":{"cols","rows"}}` sets the
+        size. Requires the sandbox to be running.
+      responses:
+        "101": { description: Switching Protocols (WebSocket) }
+        "409": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
   /v1/snapshots:
     get:
       operationId: listSnapshots
@@ -1287,13 +1532,23 @@ components:
       properties:
         version: { type: string }
         git_commit: { type: string }
+        update_available: { type: boolean, description: "True when a newer release exists (best-effort, cached ~6h). Also true for builds with no comparable version (see update_kind)." }
+        update_kind: { type: string, enum: [release, untagged], description: "Why an update is reported: release (an older tagged build) or untagged (dev / bare commit / describe-form build). Omitted when no update is reported." }
+        latest_version: { type: string, description: "Latest release tag, once fetched." }
+        changelog_url: { type: string, description: "Release page of latest_version." }
+        latest_notes: { type: string, description: "Release notes of latest_version (markdown, capped at 16 KB)." }
+        latest_breaking: { type: string, description: "The \"Breaking changes\" section of latest_notes (markdown); omitted when the release has none." }
+        latest_published_at: { type: string, format: date-time }
         networking:
           type: object
           properties:
             preview_domain: { type: string }
             public_http_port: { type: string }
-            preview_base: { type: string }
+            preview_base: { type: string, description: "scheme://<pattern>[:port] covering every preview host: *.preview.<domain> (nested) or s-*-*[--tag].<domain> (flat)." }
+            preview_host_style: { type: string, enum: [nested, flat], description: "Hostname layout under preview_domain (PREVIEW_HOST_STYLE). nested: s-<id>-<port>.preview.<domain>; flat: s-<id>-<port>[--tag].<domain>." }
+            preview_host_tag: { type: string, description: "Instance tag appended to flat-style hosts (PREVIEW_HOST_TAG); omitted when unset." }
             preview_tls: { type: boolean }
+            preview_url_scheme: { type: string, description: "Effective scheme of generated preview URLs: http or https (PREVIEW_URL_SCHEME, else derived from preview_tls)." }
             preview_entrypoint: { type: string }
         auth:
           type: object
@@ -1319,6 +1574,10 @@ components:
           properties:
             providers: { type: array, items: { type: string } }
             system_prompt: { type: string, description: "Read-only platform system prompt appended to every agent run." }
+            default_models:
+              type: object
+              additionalProperties: { type: string }
+              description: "Per-agent default model id (agent -> model), used when a task doesn't specify one. Editable via PATCH agents.default_models."
         presets:
           type: array
           items: { $ref: "#/components/schemas/Preset" }

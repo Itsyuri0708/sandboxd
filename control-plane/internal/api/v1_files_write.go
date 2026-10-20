@@ -25,7 +25,7 @@ import (
 // writes to `/home/sandbox/sandbox.yaml`, which returns 200 but runtimed never sees
 // it (the console "Apply sandbox.yaml" CTA depends on this; don't "simplify" it).
 //
-// Security model (paying-tenant threat model from CLAUDE.md):
+// Security model (paying-tenant threat model):
 //   - The caller holds a service token; the upstream backend bugs are the
 //     primary concern, not malicious traffic.
 //   - Path is `filepath.Clean`-normalised, absolute paths and `..` are
@@ -136,7 +136,12 @@ func (s *Server) v1PutFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	full, rel, err := resolveWritePath(mnt, r.URL.Query().Get("path"))
+	// Paths are relative to the APP dir (workspace/app), matching GET /files and
+	// /files/content. Writing relative to the workspace root instead left console
+	// editor saves invisible to reads (they landed a directory above the app), so
+	// the editor looked read-only. appDirFor is under mnt, so the chown-up loop
+	// below (bounded by mnt) still fixes ownership of any dirs it creates.
+	full, rel, err := resolveWritePath(s.appDirFor(id), r.URL.Query().Get("path"))
 	if err != nil {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return

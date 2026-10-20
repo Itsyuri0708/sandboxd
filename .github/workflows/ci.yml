@@ -41,8 +41,17 @@ jobs:
   # create -> seed -> install -> serve -> wake lifecycle on Docker. Also
   # smoke-tests the image (agent CLIs + default template on PATH), so a
   # change that drops OpenCode or the react-standard template fails here.
+  #
+  # Matrixed across amd64 and arm64 hosted runners — sandboxd's images are
+  # built natively (no cross-compilation), so arm64 (Apple Silicon, Graviton,
+  # etc.) only stays working if it's actually built and driven end-to-end
+  # here, not just assumed from multi-arch base images.
   e2e:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -54,11 +63,11 @@ jobs:
         run: cd control-plane && go build -o /tmp/sandboxd ./cmd/sandboxd
 
       - name: build base image
-        run: docker build -f image/Dockerfile -t sandboxed-base:ci .
+        run: docker build -f image/Dockerfile -t sandboxd-base:ci .
 
       - name: e2e
         env:
-          SANDBOXD_IMAGE: sandboxed-base:ci
+          SANDBOXD_IMAGE: sandboxd-base:ci
           SANDBOXD_BIN: /tmp/sandboxd
         run: bash scripts/e2e.sh
 
@@ -105,3 +114,7 @@ jobs:
         run: bash -n install.sh
       - name: install.sh platform logic (docker stubbed)
         run: bash scripts/test-install.sh
+      - name: parse upgrade.sh + release.sh
+        run: bash -n upgrade.sh release.sh
+      - name: upgrade.sh release notes + breaking-changes prompt (curl stubbed)
+        run: bash scripts/test-upgrade-notes.sh

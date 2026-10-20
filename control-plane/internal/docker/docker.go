@@ -1,13 +1,12 @@
 // Package docker is a thin, typed wrapper around the `docker` CLI.
 //
-// CLAUDE.md control-plane scope: "Shells out to `docker` CLI via
-// os/exec. Replace with the Docker SDK only when shell-out is a
-// measured bottleneck." Phase 4 keeps this rule.
+// Shells out to the `docker` CLI via os/exec. Replace with the Docker
+// SDK only when shell-out is a measured bottleneck.
 //
 // Design rule: NO MAGIC DEFAULTS inside this package. Callers pass
 // the full RunSpec so a change to the locked flag set is obvious in
 // code review. The package only encodes the CLI invocation, not the
-// policy choices documented in CLAUDE.md.
+// policy choices.
 package docker
 
 import (
@@ -16,8 +15,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/creack/pty"
 )
 
 // ErrNotFound is returned when `docker inspect` reports the target
@@ -39,6 +41,7 @@ type RunSpec struct {
 	Hostname    string   // --hostname
 	Network     string   // --network (OSS: shared sandboxd_net so Traefik can route)
 	Userns      string   // --userns (OSS: "host" for deterministic workspace ownership)
+	Runtime     string   // --runtime ("runsc"=gVisor); "" = daemon default (runc)
 	ReadOnly    bool     // --read-only
 	CapDrop     []string // --cap-drop=ALL (passed once per entry)
 	SecurityOpt []string // --security-opt=no-new-privileges
@@ -69,6 +72,9 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) (string, error) {
 	}
 	if spec.Userns != "" {
 		args = append(args, "--userns", spec.Userns)
+	}
+	if spec.Runtime != "" {
+		args = append(args, "--runtime", spec.Runtime)
 	}
 	if spec.ReadOnly {
 		args = append(args, "--read-only")
@@ -291,6 +297,30 @@ func (c *Client) Exec(ctx context.Context, name string, cmd []string) (ExecResul
 	return res, err
 }
 
+// ExecTTY starts an INTERACTIVE command in the named container over a PTY and
+// returns the PTY master + the running *exec.Cmd. `-i -t` gives the in-container
+// process a real terminal; user/workdir scope it (e.g. uid-1000 "sandbox" in the
+// app workspace). The caller streams the PTY to a client, resizes it with
+// pty.Setsize, and MUST Close the PTY and Kill the process when the session ends.
+// This is the interactive counterpart to Exec (which is deliberately one-shot).
+func (c *Client) ExecTTY(name, user, workdir string, argv []string) (*os.File, *exec.Cmd, error) {
+	args := []string{"exec", "-i", "-t"}
+	if user != "" {
+		args = append(args, "-u", user)
+	}
+	if workdir != "" {
+		args = append(args, "-w", workdir)
+	}
+	args = append(args, name)
+	args = append(args, argv...)
+	cmd := exec.Command(c.Bin, args...)
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ptmx, cmd, nil
+}
+
 // ListByNamePrefix returns the names of all containers (any state)
 // whose name starts with the given prefix. Used by the reconciler to
 // find orphans.
@@ -307,6 +337,17 @@ func (c *Client) ListByNamePrefix(ctx context.Context, prefix string) ([]string,
 		}
 	}
 	return names, nil
+}
+
+// ServerVersion returns the daemon version via `docker version`, which keeps
+// working on daemons where `docker info` fails to render (seen on 28.5:
+// "netip.ParsePrefix: no '/'"). Used by telemetry; readyz keeps using Info.
+func (c *Client) ServerVersion(ctx context.Context) (string, error) {
+	out, err := c.run(ctx, "version", "--format", "{{.Server.Version}}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // Info runs `docker info -f {{.ServerVersion}}` for the readyz probe.

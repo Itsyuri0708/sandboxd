@@ -1,4 +1,4 @@
-// v1.go — the narrow public /v1 API (ops/design/v1-external-api.md).
+// v1.go — the narrow public /v1 API.
 // It is a thin translation layer over the proven internal machinery:
 // sandbox create/delete delegate to the existing internal handlers;
 // runtime/task state is read via runtime.Client over the workspace
@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -115,15 +114,31 @@ func (s *Server) delegate(r *http.Request, h http.HandlerFunc, method, path stri
 	return rec.Code, rec.Body.Bytes()
 }
 
-func (s *Server) previewURL(id string, webPort int) string {
-	// Reflect the actual scheme: previews are served over plain HTTP
-	// unless PreviewTLS is configured (so a local/default deploy returns
-	// a reachable http:// URL the console can iframe).
-	scheme := "http"
-	defaultPort := "80"
+// previewScheme is the scheme (and its default port) generated preview URLs
+// use: PreviewURLScheme when set, else derived from PreviewTLS.
+func (s *Server) previewScheme() (scheme, defaultPort string) {
+	switch s.PreviewURLScheme {
+	case "https":
+		return "https", "443"
+	case "http":
+		return "http", "80"
+	}
 	if s.PreviewTLS {
-		scheme = "https"
-		defaultPort = "443"
+		return "https", "443"
+	}
+	return "http", "80"
+}
+
+func (s *Server) previewURL(id string, webPort int) string {
+	// Reflect the scheme the browser must use: plain HTTP by default (so a
+	// local deploy returns a reachable http:// URL the console can iframe),
+	// https when we terminate TLS OR when something in front of us does.
+	scheme, defaultPort := s.previewScheme()
+	// An explicit PREVIEW_URL_SCHEME means something in front of us owns the
+	// public port (a TLS terminator on 443, a tunnel gateway): our own host
+	// port is not what the browser dials, so it must not appear in the URL.
+	if s.PreviewURLScheme != "" {
+		defaultPort = s.PublicHTTPPort
 	}
 	if webPort <= 0 {
 		webPort = 3000 // backward-compatible default
@@ -131,7 +146,7 @@ func (s *Server) previewURL(id string, webPort int) string {
 	// The preview hostname's port is the sandbox's RESOLVED web port (manifest /
 	// preset / 3000) — the same port the Traefik router serves — so a non-3000
 	// app (e.g. Astro on 4321) gets a reachable URL.
-	host := fmt.Sprintf("s-%s-%d.preview.%s", id, webPort, s.PreviewDomain)
+	host := s.hosts().Preview(id, webPort)
 	// Append the host-facing port unless it's the scheme default. On a
 	// shared host published on e.g. :18080, the bare URL would hit whatever
 	// owns :80 (a front proxy), so the port must be in the URL the browser,
@@ -208,7 +223,7 @@ type v1CreateReq struct {
 	Visibility string `json:"visibility,omitempty"`
 	Template   string `json:"template,omitempty"`
 	// FromSnapshot, when set, clones the new sandbox's workspace from a
-	// snapshot the caller's tenant owns (ops/design/snapshots-as-templates.md)
+	// snapshot the caller's tenant owns
 	// instead of the default template. Mutually exclusive with Template.
 	FromSnapshot string `json:"from_snapshot,omitempty"`
 	// RuntimePreset selects a runtime preset (react-vite, nextjs, …). Applied
