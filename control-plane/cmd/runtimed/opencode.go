@@ -234,8 +234,9 @@ func zenUpstream() string {
 // region). Context window, pricing, input modality, cache, and thinking
 // metadata for these models are documented in docs/agent-auth.md.
 var minimaxModels = map[string]bool{
-	"MiniMax-M3":   true,
-	"MiniMax-M2.7": true,
+	"MiniMax-M3.1-Flash": true,
+	"MiniMax-M3":         true,
+	"MiniMax-M2.7":       true, // Preserve explicit legacy model requests.
 }
 
 // minimaxUpstream returns the proxy <upstream> segment for a MiniMax model:
@@ -288,7 +289,7 @@ func ipBaseURL(raw string) (string, error) {
 // sandbox. The requested model is exposed as `proxy/<id>`.
 //
 // The <upstream> segment is chosen from the model id: MiniMax models
-// (MiniMax-M3 / MiniMax-M2.7) route to a direct MiniMax OpenAI-compatible
+// (MiniMax-M3.1-Flash / MiniMax-M3, plus explicit legacy requests) use a direct OpenAI-compatible
 // upstream (the China region is selected with SANDBOXD_MINIMAX_REGION=cn_zh);
 // every other model keeps the existing Zen path (zen | zengo).
 //
