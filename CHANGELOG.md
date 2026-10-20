@@ -6,6 +6,14 @@ All notable changes to sandboxd are documented here. The format is based on
 patch** — each lands the meaningful changes merged since the last one — and a
 **minor bump marks a milestone** release).
 
+## [Unreleased]
+
+### Added
+
+- Offer MiniMax M3.1 Flash before M3 in the OpenCode model picker and route it
+  through the direct MiniMax proxy. Preserve saved defaults and explicit legacy
+  model requests; M2.7 is no longer offered in the ordinary picker.
+
 ## [0.3.22] — 2026-10-12
 
 ### Fixed
