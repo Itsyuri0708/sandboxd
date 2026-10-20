@@ -50,9 +50,9 @@ var upstreams = map[string]string{
 	// Anthropic-compatible (/anthropic) flavor. Their credential is the
 	// connected MiniMax API key (see credFor), not the carrying agent's own.
 	"minimax":              "https://api.minimax.io/v1",
-	"minimax-cn":           "https://api.minimaxi.com/v1",
+	"minimax-cn":           "https://api.minimaxi.cn/v1",
 	"minimax-anthropic":    "https://api.minimax.io/anthropic",
-	"minimax-anthropic-cn": "https://api.minimaxi.com/anthropic",
+	"minimax-anthropic-cn": "https://api.minimaxi.cn/anthropic",
 }
 
 // isMiniMaxUpstream reports whether <upstream> is one of the MiniMax direct
