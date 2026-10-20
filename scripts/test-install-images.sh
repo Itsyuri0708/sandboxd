@@ -134,6 +134,7 @@ for scenario in build pull bad-signature; do
   if PATH="$tmp/bin:$PATH" TEST_SIGNATURE_FAIL="$fail" SANDBOXD_NO_SPONSOR=1 \
       bash "$checkout/install.sh" "--$mode" > "$tmp/installer-output" 2>&1; then
     [ "$scenario" != bad-signature ]
+    grep -q '^docker compose pull --policy missing traefik$' "$TEST_LOG"
     grep -q '^docker compose --profile console up -d --pull never$' "$TEST_LOG"
     if [ "$scenario" = pull ]; then
       [ "$(grep -c '^cosign verify ' "$TEST_LOG")" = 3 ]

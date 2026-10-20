@@ -166,7 +166,8 @@ curl -fsSL https://raw.githubusercontent.com/tastyeffectco/sandboxd/main/install
 ```
 
 On a clean stable release checkout with `cosign` installed, it pulls and verifies
-the matching prebuilt images. Otherwise it builds from source. It starts the stack **with the web console**, and prints your
+the matching prebuilt images. Otherwise it builds from source. It starts the
+stack **with the web console**, and prints your
 **console URL + a generated login** — no password step. Open it, connect an agent
 under **Settings**, create an app, and build. No code needed.
 

@@ -231,9 +231,9 @@ printf 'SANDBOXD_IMAGE=%s\nSANDBOXD_CONTROL_PLANE_IMAGE=%s\nSANDBOXD_CONSOLE_IMA
 mv "$tmp" .env
 STAGE=stack
 bold "Starting the stack…"
-# Pull the non-application proxy separately; application tags must not move
-# between signature verification and startup.
-$COMPOSE pull traefik
+# Fetch the proxy only if missing; application tags must not move between
+# signature verification and startup.
+$COMPOSE pull --policy missing traefik
 $COMPOSE $PROFILE_ARGS up -d --pull never
 ok "stack is up"
 chmod +x console-login.sh 2>/dev/null || true   # so `./console-login.sh` always runs
