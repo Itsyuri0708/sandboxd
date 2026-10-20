@@ -55,7 +55,9 @@ services:
         # upgrade.sh & install.sh export these from `git describe`; default dev.
         VERSION: ${SANDBOXD_VERSION:-dev}
         GIT_COMMIT: ${SANDBOXD_GIT_COMMIT:-unknown}
-    image: sandboxd-control-plane:0.3.0
+    # The installer records verified release image names in .env; source
+    # builds keep local defaults or the operator's explicit image names.
+    image: ${SANDBOXD_CONTROL_PLANE_IMAGE:-sandboxd-control-plane:0.3.0}
     restart: unless-stopped
     userns_mode: "host"  # see traefik above
     # Reachable on the internal network as http://sandboxd:9000. The API
@@ -149,7 +151,7 @@ services:
     profiles: [console]
     build:
       context: ./console
-    image: sandboxd-console:0.3.0
+    image: ${SANDBOXD_CONSOLE_IMAGE:-sandboxd-console:0.3.0}
     restart: unless-stopped
     depends_on:
       - sandboxd
