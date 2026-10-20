@@ -1,7 +1,7 @@
 # Publish the three sandboxd images to GHCR, multi-arch, on a version tag.
 #
-# Trigger: pushing a tag like `v0.4.0` (or a manual run with an explicit
-# version). Each image is built for linux/amd64 + linux/arm64, pushed to
+# Trigger: pushing a stable tag like `v0.4.0` (or a manual run on that
+# same tag). Each image is built for linux/amd64 + linux/arm64, pushed to
 # ghcr.io/<owner>/<image>:<version>, given a SLSA build-provenance attestation
 # and an SBOM, and signed keylessly with cosign (Sigstore OIDC — no stored
 # keys). Consumers can verify: image == this tag == this workflow.
@@ -14,17 +14,13 @@ name: release-images
 on:
   push:
     tags: ['v*']
+  # Manual runs must select the same stable release tag as automatic runs.
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to publish (e.g. 0.4.0)'
-        required: true
 
 permissions:
   contents: read
   packages: write      # push to GHCR
   id-token: write      # cosign keyless (Sigstore OIDC)
-  attestations: write  # SLSA provenance attestation
 
 jobs:
   publish:
@@ -45,24 +41,24 @@ jobs:
             context: ./console
             dockerfile: ./console/Dockerfile
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version
+      - name: Require a stable release tag
         id: ver
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ inputs.version }}"
-          else
-            V="${GITHUB_REF_NAME#v}"   # tag v0.4.0 -> 0.4.0
+          if [[ "$GITHUB_REF_TYPE" != tag || ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Select a stable vMAJOR.MINOR.PATCH tag; branch/manual version overrides are not allowed." >&2
+            exit 1
           fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3        # arm64 emulation on amd64 runners
-      - uses: docker/setup-buildx-action@v3
-      - uses: sigstore/cosign-installer@v3       # cosign on PATH, correct version
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3        # arm64 emulation on amd64 runners
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3       # cosign on PATH, correct version
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -70,7 +66,7 @@ jobs:
 
       - name: Build & push (multi-arch, provenance + SBOM)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
@@ -81,7 +77,10 @@ jobs:
           sbom: true
           # buildvcs off — the base image's runtimed stage builds from a bind
           # context without .git; mirrors image/build.sh + local builds.
-          build-args: GOFLAGS=-buildvcs=false
+          build-args: |
+            GOFLAGS=-buildvcs=false
+            VERSION=${{ steps.ver.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
 
       - name: Sign the pushed image (cosign keyless)
         env:
@@ -90,7 +89,10 @@ jobs:
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Summary
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+          IMAGE_VERSION: ${{ steps.ver.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          echo "Published **${{ matrix.name }}:${{ steps.ver.outputs.version }}**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- digest: \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- signed (cosign keyless) + SLSA provenance + SBOM" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Published **%s:%s**\n- digest: `%s`\n- cosign signature, provenance and SBOM\n' \
+            "$IMAGE_NAME" "$IMAGE_VERSION" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"

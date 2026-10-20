@@ -12,9 +12,9 @@ jobs:
       run:
         working-directory: control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: control-plane/go.mod
 
@@ -53,9 +53,9 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: control-plane/go.mod
 
@@ -63,11 +63,11 @@ jobs:
         run: cd control-plane && go build -o /tmp/sandboxd ./cmd/sandboxd
 
       - name: build base image
-        run: docker build -f image/Dockerfile -t sandboxed-base:ci .
+        run: docker build -f image/Dockerfile -t sandboxd-base:ci .
 
       - name: e2e
         env:
-          SANDBOXD_IMAGE: sandboxed-base:ci
+          SANDBOXD_IMAGE: sandboxd-base:ci
           SANDBOXD_BIN: /tmp/sandboxd
         run: bash scripts/e2e.sh
 
@@ -79,8 +79,8 @@ jobs:
       run:
         working-directory: console
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - name: enable pnpm
@@ -109,8 +109,14 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: parse install.sh
         run: bash -n install.sh
       - name: install.sh platform logic (docker stubbed)
         run: bash scripts/test-install.sh
+      - name: parse upgrade.sh + release.sh
+        run: bash -n upgrade.sh release.sh
+      - name: upgrade.sh release notes + breaking-changes prompt (curl stubbed)
+        run: bash scripts/test-upgrade-notes.sh
+      - name: verified release image selection (Docker and cosign stubbed)
+        run: bash scripts/test-install-images.sh

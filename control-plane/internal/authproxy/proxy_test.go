@@ -220,3 +220,157 @@ func TestCodexNoCredentialStill401(t *testing.T) {
 		t.Fatalf("codex unconnected = %d; want 401 (only opencode has a free tier)", w.Code)
 	}
 }
+
+// MiniMax is a credential-only upstream: the connected MiniMax API key is
+// injected (Bearer) regardless of which carrying agent is in the path, and the
+// global OpenAI-compatible base path (/v1) is preserved.
+func TestMiniMaxInjectsKeyGlobalOpenAI(t *testing.T) {
+	var gotAuth, gotKey, gotPath string
+	stubUpstream(t, "minimax", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotKey, gotPath = r.Header.Get("Authorization"), r.Header.Get("X-Api-Key"), r.URL.Path
+		w.WriteHeader(200)
+	})
+	st := agentauth.NewStore(t.TempDir())
+	writeAPIKey(t, st, "minimax", "minimax-REAL-KEY")
+	p := New(st, nil)
+
+	// Carried by opencode — the agent's own credential is irrelevant here.
+	req := httptest.NewRequest("POST", "/opencode/minimax/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer sandboxd-proxy-injected") // the dummy
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status %d; want 200", w.Code)
+	}
+	if gotAuth != "Bearer minimax-REAL-KEY" {
+		t.Errorf("Authorization = %q; want the injected MiniMax key", gotAuth)
+	}
+	if gotKey != "" {
+		t.Errorf("X-Api-Key leaked: %q (MiniMax uses Bearer)", gotKey)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("forwarded path = %q; want /v1/chat/completions (base /v1 preserved)", gotPath)
+	}
+}
+
+// MiniMax with no connected key → 401 (a clear "connect it" error), even when
+// the carrying agent (opencode) would otherwise fall back to its keyless tier.
+func TestMiniMaxNoCredential401(t *testing.T) {
+	stubUpstream(t, "minimax", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	p := New(agentauth.NewStore(t.TempDir()), nil) // nothing connected
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest("POST", "/opencode/minimax/v1/chat/completions", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unconnected minimax = %d; want 401", w.Code)
+	}
+}
+
+// The China region upstream (minimax-cn) hits api.minimaxi.com and carries the
+// same injected key.
+func TestMiniMaxChinaEndpoint(t *testing.T) {
+	var gotAuth, gotPath string
+	stubUpstream(t, "minimax-cn", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotPath = r.Header.Get("Authorization"), r.URL.Path
+		w.WriteHeader(200)
+	})
+	st := agentauth.NewStore(t.TempDir())
+	writeAPIKey(t, st, "minimax", "minimax-REAL-KEY")
+	p := New(st, nil)
+
+	req := httptest.NewRequest("POST", "/opencode/minimax-cn/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if gotAuth != "Bearer minimax-REAL-KEY" {
+		t.Errorf("Authorization = %q; want the injected MiniMax key", gotAuth)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("forwarded path = %q; want /v1/chat/completions", gotPath)
+	}
+}
+
+// The Anthropic-compatible MiniMax endpoint (/anthropic base) is also reached
+// with the Bearer key (MiniMax's anthropic-compatible API accepts Bearer).
+func TestMiniMaxAnthropicEndpointBearer(t *testing.T) {
+	var gotAuth, gotKey, gotPath string
+	stubUpstream(t, "minimax-anthropic", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotKey, gotPath = r.Header.Get("Authorization"), r.Header.Get("X-Api-Key"), r.URL.Path
+		w.WriteHeader(200)
+	})
+	st := agentauth.NewStore(t.TempDir())
+	writeAPIKey(t, st, "minimax", "minimax-REAL-KEY")
+	p := New(st, nil)
+
+	req := httptest.NewRequest("POST", "/opencode/minimax-anthropic/anthropic/v1/messages", nil)
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if gotAuth != "Bearer minimax-REAL-KEY" {
+		t.Errorf("Authorization = %q; want Bearer (MiniMax anthropic-compat)", gotAuth)
+	}
+	if gotKey != "" {
+		t.Errorf("X-Api-Key set: %q; MiniMax anthropic-compat uses Bearer", gotKey)
+	}
+	if gotPath != "/anthropic/v1/messages" {
+		t.Errorf("forwarded path = %q; want /anthropic/v1/messages (base /anthropic preserved)", gotPath)
+	}
+}
+
+// isMiniMaxUpstream recognizes all four MiniMax direct upstream keys.
+func TestIsMiniMaxUpstream(t *testing.T) {
+	for _, up := range []string{"minimax", "minimax-cn", "minimax-anthropic", "minimax-anthropic-cn"} {
+		if !isMiniMaxUpstream(up) {
+			t.Errorf("%q should be a MiniMax upstream", up)
+		}
+	}
+	for _, up := range []string{"anthropic", "openai", "zen", "zengo", "", "minimaxx"} {
+		if isMiniMaxUpstream(up) {
+			t.Errorf("%q should NOT be a MiniMax upstream", up)
+		}
+	}
+}
+
+// A provider that says "quota exhausted" must fail the task immediately: agent
+// CLIs retry 401/429 for minutes, which surfaced as the misleading task error
+// "agent did not finish within the task timeout" long after the provider had
+// already given a precise answer.
+func TestTerminalProviderError(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		body     string
+		terminal bool
+	}{
+		{"minimax quota exhausted", 429,
+			`{"error":{"message":"Token Plan usage limit reached: Upgrade your Token Plan or purchase Credits for more usage. (2056)"}}`, true},
+		{"openai insufficient quota", 429, `{"error":{"message":"You exceeded your current quota"}}`, true},
+		{"plain rate limit stays retryable", 429,
+			`{"error":{"message":"Rate limit reached for requests, please slow down"}}`, false},
+		{"bad credentials", 401, `{"error":{"message":"invalid api key"}}`, true},
+		{"payment required", 402, `{"error":{"message":"balance too low"}}`, true},
+		{"forbidden", 403, `{"error":{"message":"model not allowed for this key"}}`, true},
+		{"server error is retryable", 500, `oops`, false},
+		{"not found is not a credential problem", 404, `{"error":{"message":"no such model"}}`, false},
+	}
+	for _, tc := range cases {
+		reason, got := terminalProviderError(tc.status, tc.body)
+		if got != tc.terminal {
+			t.Errorf("%s: terminal = %v, want %v", tc.name, got, tc.terminal)
+		}
+		if got && reason == "" {
+			t.Errorf("%s: a terminal error must carry a plain-language reason", tc.name)
+		}
+	}
+}
+
+func TestProviderMessageExtractsTheProvidersOwnWords(t *testing.T) {
+	cases := []struct{ name, body, want string }{
+		{"error.message envelope", `{"error":{"message":"Token Plan usage limit reached"}}`, "Token Plan usage limit reached"},
+		{"top-level message", `{"message":"insufficient balance"}`, "insufficient balance"},
+		{"non-json falls back to the raw text", `upstream exploded`, "upstream exploded"},
+	}
+	for _, tc := range cases {
+		if got := providerMessage([]byte(tc.body)); got != tc.want {
+			t.Errorf("%s: providerMessage = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

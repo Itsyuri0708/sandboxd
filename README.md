@@ -38,25 +38,18 @@
 
 <p align="center"><b>Prompt → a real, running app on <i>your</i> server, at its own URL.</b><br/>See it in action 👇</p>
 
-<h3 align="center">1&nbsp;·&nbsp;Build an app from a prompt — in the console</h3>
-<p align="center"><i>Describe what you want; a coding agent builds it inside an isolated sandbox and it appears at a live preview URL.</i></p>
-<p align="center">
-  <img width="900" alt="Create a blog from a prompt in the sandboxd console" src="https://github.com/user-attachments/assets/582f5c46-af57-41c1-b9ed-4081d1075c51" />
-</p>
-
-<h3 align="center">2&nbsp;·&nbsp;Or launch an existing open-source app — one click</h3>
-<p align="center"><i>n8n, Ghost, Grafana, Gitea… 80+ curated apps, installed and live at their own URL.</i></p>
-<p align="center">
-  <img width="900" alt="Run an existing open-source app (n8n) in sandboxd" src="https://github.com/user-attachments/assets/a89b03c9-0f4d-4b19-b190-ecd27dd10d10" />
-</p>
-
-<h3 align="center">3&nbsp;·&nbsp;Prefer code? Drive it all from the API / CLI</h3>
-<p align="center"><i>Every action is a <code>/v1</code> call — headless, scriptable, and easy to build into your own product.</i></p>
-<p align="center">
-  <img width="900" alt="Drive sandboxd from the API / CLI" src="https://github.com/user-attachments/assets/0854fbd6-6801-42e3-bb42-55f8a4f9ead7" />
-</p>
-
-<p align="center"><b>▶ <a href="https://sandboxd.io/demo/">Try the live demo</a></b> — click around a real console with sample data, no install.</p>
+<div align="center">
+<table>
+  <tr>
+    <td width="50%"><img alt="Build an app from a prompt in the sandboxd console" src="https://github.com/user-attachments/assets/582f5c46-af57-41c1-b9ed-4081d1075c51"><br><sub><b>1 · Build from a prompt</b> — an agent builds it in an isolated sandbox, live at a preview URL.</sub></td>
+    <td width="50%"><img alt="Run an existing open-source app (n8n) in sandboxd" src="https://github.com/user-attachments/assets/a89b03c9-0f4d-4b19-b190-ecd27dd10d10"><br><sub><b>2 · Or run an existing app</b> — n8n, Ghost, Grafana… 80+ curated apps, one click.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img alt="Drive sandboxd from the API / CLI" src="https://github.com/user-attachments/assets/0854fbd6-6801-42e3-bb42-55f8a4f9ead7"><br><sub><b>3 · Or drive the API</b> — every action is a <code>/v1</code> call, headless &amp; scriptable.</sub></td>
+    <td width="50%" align="center"><br><b>▶ <a href="https://sandboxd.io/demo/">Try the live demo</a></b><br><br><sub>Click around a real console with sample data — no install.</sub></td>
+  </tr>
+</table>
+</div>
 
 ---
 
@@ -172,16 +165,20 @@ builds from multi-arch bases with no cross-compilation. Install in one line:
 curl -fsSL https://raw.githubusercontent.com/tastyeffectco/sandboxd/main/install.sh | bash
 ```
 
-It pulls the prebuilt images (or builds from source if none are published for
-your version), starts the stack **with the web console**, and prints your
+On a clean stable release checkout with `cosign` installed, it pulls and verifies
+the matching prebuilt images. Otherwise it builds from source. It starts the stack **with the web console**, and prints your
 **console URL + a generated login** — no password step. Open it, connect an agent
 under **Settings**, create an app, and build. No code needed.
 
 - **Build from source instead:** run **`./install.sh --build`** — a first-class,
   fully-supported path. Compiles every image locally so you audit exactly what
-  runs. Prebuilt images are multi-arch, **cosign-signed with SLSA provenance**
-  (built only by [CI](.github/workflows/release-images.yml) from the tagged
-  commit) — so pulling is verifiable, and building yourself is always an option.
+  runs. Prebuilt images are multi-arch, **cosign-signed with build provenance**
+  by [the release workflow](.github/workflows/release-images.yml). The installer
+  verifies each pulled digest against that workflow's identity at the exact
+  release tag before starting services. `./install.sh --pull` requires those
+  checks to succeed; `--build` and custom image names use local builds. No
+  signing tools are downloaded by the installer. A failure falls back to source
+  in automatic mode, or stops without starting the stack in `--pull` mode.
 - **Console:** `http://console.localhost` — the installer prints your login; lost
   it? run **`./console-login.sh`** to see it again anytime
 - **API:** `http://127.0.0.1:9090` (`curl http://127.0.0.1:9090/healthz` → `ok`)
@@ -252,6 +249,16 @@ environments, or team multi-app hosting.
 script or `docker run` is simpler.
 ([Why not just a script?](https://sandboxd.io/what-is-sandboxd))
 
+## Get a public URL — sandboxd Cloud
+
+Out of the box, previews live on `<ip>.sslip.io` or `localhost`: fine on your
+network, useless for sharing. **[sandboxd Cloud](https://sandboxd.io/cloud)**
+gives the server you already run `https://you.sandboxd.io` (console, API and
+`*.preview.you.sandboxd.io`) in one command — no domain, DNS, open ports or
+certificates, and it works behind NAT, on a laptop, or on a $5 VPS. Your
+compute and data stay on your machine. $9.99/server/month, 50% off at launch.
+Prefer your own domain? [Production / TLS](https://sandboxd.io/guides/production-tls).
+
 ## Managed — we run it for you
 
 Don't want to run the server yourself? We'll **install, configure, and manage
@@ -289,7 +296,7 @@ copy-pasteable runbook.
 Stars are how other builders find sandboxd — it's the fastest way to support the
 project (and it keeps us going). Thank you 🙏
 
-[![Star History Chart](https://api.star-history.com/svg?repos=tastyeffectco/sandboxd&type=Date)](https://star-history.com/#tastyeffectco/sandboxd&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=tastyeffectco/sandboxd&type=Date)](https://star-history.dera.page/#tastyeffectco/sandboxd&type=Date)
 
 ## License
 

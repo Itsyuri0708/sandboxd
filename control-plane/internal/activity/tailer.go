@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/previewhost"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -29,7 +30,7 @@ import (
 //     the file at offset 0.
 //   - Survive truncation: detect via current-size < last-read-offset;
 //     reopen at 0.
-//   - Checkpoint the byte offset to /var/lib/sandboxed/state/
+//   - Checkpoint the byte offset to /var/lib/sandboxd/state/
 //     so a daemon restart doesn't replay the entire log. A stale
 //     checkpoint is fine — we only ever move last_active_at forward.
 //
@@ -37,13 +38,13 @@ import (
 // can write partial trailing bytes during rotation). A line that
 // doesn't parse as JSON is logged at debug-level and skipped.
 type Tailer struct {
-	LogPath        string // /var/log/sandboxed/traefik-access.log
-	CheckpointPath string // /var/lib/sandboxed/state/traefik-tail.offset
-	PreviewDomain  string // example.com
+	LogPath        string // /var/log/sandboxd/traefik-access.log
+	CheckpointPath string // /var/lib/sandboxd/state/traefik-tail.offset
+	Hosts          previewhost.Scheme
 	Store          *store.Store
 	Log            *slog.Logger
 
-	hostRE     *regexp.Regexp // ^s-([0-9A-Za-z]+)-([0-9]+)\.preview\.<domain>(:.*)?$
+	hostRE     *regexp.Regexp // Hosts.HostRegexp()
 	mu         sync.Mutex
 	lastBumped time.Time
 }
@@ -70,15 +71,9 @@ func (t *Tailer) Run(ctx context.Context) error {
 }
 
 func (t *Tailer) compileHostRE() error {
-	// Match `s-<id>-<port>.preview.<domain>` with an optional `:port`
-	// suffix (some proxies include it in the Host header).
-	pat := `^s-([0-9A-Za-z]+)-([0-9]+)\.preview\.` +
-		regexp.QuoteMeta(t.PreviewDomain) + `(?::\d+)?$`
-	re, err := regexp.Compile(pat)
-	if err != nil {
-		return fmt.Errorf("compile preview-host regex: %w", err)
-	}
-	t.hostRE = re
+	// Matches the preview host shape with an optional `:port` suffix
+	// (some proxies include it in the Host header).
+	t.hostRE = t.Hosts.HostRegexp()
 	return nil
 }
 

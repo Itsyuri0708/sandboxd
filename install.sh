@@ -24,51 +24,38 @@ set -euo pipefail
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 info() { printf '  \033[36m›\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
-die()  { emit_fail "${2:-unexpected}" 1; printf '  \033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
+die()  { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-# ── telemetry: anonymous install_failed (enum-only, no PII) ──────────
-# Emits ONE event when the install aborts, so we can see WHERE the quickstart
-# breaks. Strict whitelist: step + error_class (both enums), exit code,
-# os/arch/version, a bucketed duration. NEVER raw errors, paths, hostnames, or
-# env values. Honors SANDBOXD_TELEMETRY=off; sends $ip empty.
-SANDBOXD_TELEMETRY="${SANDBOXD_TELEMETRY:-on}"
-STEP="start"
-START_TS="$(date +%s 2>/dev/null || echo 0)"
-_PH_HOST="https://us.i.posthog.com"
-_PH_KEY="phc_vyQtLTZPBHwEBcY8mcfneP43xAFGLzFVic9DhQ7VGrqV"
-err_class_for_step() {
-  case "$STEP" in
-    base_image_build|stack_build) [ "$1" = "137" ] && echo "build_oom" || echo "build_nonzero" ;;
-    image_pull)    echo "pull_failed" ;;
-    compose_up)    echo "compose_up_failed" ;;
-    docker_check)  echo "docker_missing" ;;
-    compose_check) echo "compose_missing" ;;
-    *)             echo "unexpected" ;;
+# --build always builds locally; --pull requires verified release images.
+MODE=auto
+for arg in "$@"; do
+  case "$arg" in
+    --build) MODE=build ;;
+    --pull) MODE=pull ;;
+    --no-console) ;;
+    *) die "Unknown option: $arg (use --build, --pull, or --no-console)" ;;
   esac
-}
-emit_fail() {
-  [ "${SANDBOXD_TELEMETRY}" = "off" ] && return 0
-  command -v curl >/dev/null 2>&1 || return 0
-  local class="$1" rc="${2:-1}" now dur bucket arch os ver
-  now="$(date +%s 2>/dev/null || echo 0)"; dur=$(( now - START_TS ))
-  bucket="<1m"; [ "$dur" -ge 60 ] && bucket="1-5m"; [ "$dur" -ge 300 ] && bucket="5-15m"; [ "$dur" -ge 900 ] && bucket=">15m"
-  arch="$(uname -m 2>/dev/null || echo unknown)"
-  os="$(uname -s 2>/dev/null | tr 'A-Z' 'a-z' || echo unknown)"
-  ver="$(git -C "${REPO_ROOT:-.}" describe --tags --always 2>/dev/null || echo unknown)"
-  curl -sf -m 5 -X POST "${_PH_HOST}/i/v0/e/" -H 'content-type: application/json' \
-    -d "{\"api_key\":\"${_PH_KEY}\",\"event\":\"install_failed\",\"distinct_id\":\"install-$$\",\"properties\":{\"step\":\"${STEP}\",\"error_class\":\"${class}\",\"exit_code\":${rc},\"os\":\"${os}\",\"arch\":\"${arch}\",\"version\":\"${ver}\",\"duration_bucket\":\"${bucket}\",\"\$ip\":\"\"}}" \
-    >/dev/null 2>&1 || true
-}
-# Catch unhandled failures (build/up) that don't go through die(). Guarded
-# commands inside if/|| are not trapped, so no spurious events on fallback.
-trap 'rc=$?; emit_fail "$(err_class_for_step "$rc")" "$rc"' ERR
+done
 
-# ── install mode: prebuilt images (default) vs build from source ─────
-# auto  — pull prebuilt GHCR images; fall back to building if unavailable.
-# --build — always compile from source (first-class path for self-hosters).
-# --pull  — require prebuilt images (fail if missing).
-MODE="auto"
-for _a in "$@"; do case "$_a" in --build) MODE=build ;; --pull) MODE=pull ;; esac; done
+# ── anonymous install-failure beacon ─────────────────────────────────
+# If the installer aborts, send ONE event: {stage} + a random id — nothing
+# else (no hostname, IP, paths or output). Same opt-out as the daemon:
+# SANDBOXD_TELEMETRY=off or DO_NOT_TRACK=1. See docs/telemetry.md.
+STAGE=prereqs
+tel_off() {
+  case "$(printf '%s' "${SANDBOXD_TELEMETRY:-}" | tr 'A-Z' 'a-z')" in off|0|false|no) return 0;; esac
+  case "$(printf '%s' "${DO_NOT_TRACK:-}" | tr 'A-Z' 'a-z')" in 1|true|yes) return 0;; esac
+  return 1
+}
+tel_fail() {
+  tel_off && return 0
+  id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo unknown)"
+  curl -s -m 5 -o /dev/null -X POST "${SANDBOXD_POSTHOG_HOST:-https://us.i.posthog.com}/i/v0/e/" \
+    -H 'Content-Type: application/json' \
+    -d "{\"api_key\":\"${SANDBOXD_POSTHOG_KEY:-phc_pma2C4Wg9EKf4KARJbnU5ZdcNDJGnA5oDtsypKofF2YY}\",\"event\":\"install_failed\",\"distinct_id\":\"$id\",\"properties\":{\"stage\":\"$1\",\"\$ip\":\"\"}}" \
+    2>/dev/null || true
+}
+trap 'rc=$?; [ "$rc" -ne 0 ] && tel_fail "$STAGE"; exit $rc' EXIT
 
 # ── bootstrap: fetch the repo when run standalone (curl … | bash) ────
 # Piped from curl, this script has no repo around it. Detect that, clone
@@ -79,8 +66,7 @@ if [ ! -f "$REPO_ROOT/docker-compose.yml" ] || [ ! -d "$REPO_ROOT/control-plane"
   REPO_URL="${SANDBOXD_REPO_URL:-https://github.com/tastyeffectco/sandboxd.git}"
   REF="${SANDBOXD_REF:-main}"
   SRC="${SANDBOXD_SRC:-$HOME/.sandboxd/src}"
-  STEP="git_clone"
-  command -v git >/dev/null 2>&1 || die "git is required to install sandboxd — install git and re-run." git_missing
+  command -v git >/dev/null 2>&1 || die "git is required to install sandboxd — install git and re-run."
   bold "sandboxd — fetching source"
   if [ -d "$SRC/.git" ]; then
     info "updating existing checkout at $SRC"
@@ -96,26 +82,25 @@ fi
 cd "$REPO_ROOT"
 
 # ── docker / sudo detection ──────────────────────────────────────────
+STAGE=docker
 # Use sudo for docker only if the current user can't reach the daemon.
-STEP="docker_check"
 DOCKER="docker"
 if ! docker info >/dev/null 2>&1; then
   if sudo -n docker info >/dev/null 2>&1 || sudo docker info >/dev/null 2>&1; then
     DOCKER="sudo docker"
     info "using 'sudo docker' (current user can't reach the Docker daemon)"
   else
-    die "Docker is not available. Install Docker Engine and ensure the daemon is running." docker_missing
+    die "Docker is not available. Install Docker Engine and ensure the daemon is running."
   fi
 fi
 
 # Compose v2 (docker compose) preferred; fall back to docker-compose.
-STEP="compose_check"
 if $DOCKER compose version >/dev/null 2>&1; then
   COMPOSE="$DOCKER compose"
 elif command -v docker-compose >/dev/null 2>&1; then
   COMPOSE="docker-compose"
 else
-  die "Docker Compose not found. Install the Compose plugin (docker compose)." compose_missing
+  die "Docker Compose not found. Install the Compose plugin (docker compose)."
 fi
 
 bold "sandboxd — installer"
@@ -123,6 +108,7 @@ ok "Docker:  $($DOCKER version --format '{{.Server.Version}}' 2>/dev/null || ech
 ok "Compose: $($COMPOSE version --short 2>/dev/null || echo present)"
 
 # ── .env ─────────────────────────────────────────────────────────────
+STAGE=env
 if [ ! -f .env ]; then
   cp .env.example .env
   ok "created .env from .env.example"
@@ -142,16 +128,22 @@ fi
 
 # Load .env so we know the data dir / image tag to use below.
 set -a; . ./.env; set +a
-DATA_DIR="${SANDBOXD_DATA_DIR:-/var/lib/sandboxed}"
+
+# Pre-rename installs keep their data at /var/lib/sandboxed. If .env does not pin
+# SANDBOXD_DATA_DIR and the old directory exists, pin it now — never move data.
+if [ -z "${SANDBOXD_DATA_DIR:-}" ] && [ -d /var/lib/sandboxed ] && [ ! -d /var/lib/sandboxd ]; then
+  SANDBOXD_DATA_DIR=/var/lib/sandboxed; export SANDBOXD_DATA_DIR
+  if [ -f .env ] && ! grep -q '^SANDBOXD_DATA_DIR=' .env; then
+    printf 'SANDBOXD_DATA_DIR=/var/lib/sandboxed\nSANDBOXD_LOG_DIR=/var/lib/sandboxed/log\n' >> .env
+  fi
+  echo "  › data stays at /var/lib/sandboxed (pre-rename install); new installs use /var/lib/sandboxd"
+fi
+DATA_DIR="${SANDBOXD_DATA_DIR:-/var/lib/sandboxd}"
 LOG_DIR="${SANDBOXD_LOG_DIR:-$DATA_DIR/log}"
-# Image coordinates. Prebuilt images live at $REGISTRY/<name>:$IMAGE_TAG; a
-# full base ref can be overridden via SANDBOXD_IMAGE (custom registry / local).
-IMAGE_TAG="${SANDBOXD_IMAGE_TAG:-0.3.0}"
-REGISTRY="${SANDBOXD_REGISTRY:-ghcr.io/tastyeffectco}"
-BASE_IMAGE="${SANDBOXD_IMAGE:-$REGISTRY/sandboxd-base:$IMAGE_TAG}"
-export SANDBOXD_IMAGE="$BASE_IMAGE" SANDBOXD_IMAGE_TAG="$IMAGE_TAG"
+BASE_IMAGE="${SANDBOXD_IMAGE:-sandboxd-base:0.3.0}"
 
 # ── data dir ─────────────────────────────────────────────────────────
+STAGE=data-dir
 # Create it (sudo if we don't own the parent). Workspaces + SQLite + the
 # shared access log live here.
 if [ ! -d "$DATA_DIR" ]; then
@@ -166,6 +158,7 @@ fi
 ok "data dir ready: $DATA_DIR"
 
 # ── API auth bootstrap key ───────────────────────────────────────────
+STAGE=api-key
 # Auth is ON by default: every /v1 call needs a console session or an API key.
 # Seed ONE printed bootstrap key so scripts (and the engine) work with zero
 # config. The console itself does NOT use this key — it uses a login/session.
@@ -190,6 +183,7 @@ else
 fi
 
 # ── optional web console (ON by default) ─────────────────────────────
+STAGE=console
 # The console is the fastest way to *see* sandboxd. On first open it asks you to
 # create a password (control-plane login); no secret in .env. Headless with
 # SANDBOXD_CONSOLE=0  or  --no-console.
@@ -202,11 +196,12 @@ PROFILE_ARGS=""
 # Stash the console URL + bootstrap key (gitignored, 0600) so ./console-login.sh
 # can show them again anytime.
 {
-  printf 'console_url=http://console.%s%s\n' "${PREVIEW_DOMAIN:-localhost}" "$([ "${HTTP_PORT:-80}" != "80" ] && printf ':%s' "${HTTP_PORT:-80}")"
+  printf 'console_url=http://%s%s\n' "${CONSOLE_HOST:-console.${PREVIEW_DOMAIN:-localhost}}" "$([ "${HTTP_PORT:-80}" != "80" ] && printf ':%s' "${HTTP_PORT:-80}")"
   printf 'api_key=%s\n' "$API_KEY"
 } > .console-login 2>/dev/null && chmod 600 .console-login
 
 # ── build + start the stack ──────────────────────────────────────────
+STAGE=stack
 # Compose must read SANDBOXD_API_TOKENS straight from .env. A stale empty value
 # inherited into this shell from the earlier `. ./.env` would outrank .env and
 # shadow the bootstrap key we just wrote (leaving auth on with no working key).
@@ -214,59 +209,54 @@ PROFILE_ARGS=""
 unset SANDBOXD_API_TOKENS
 # Stamp the build (sandboxd version / telemetry / settings) from git when present.
 export SANDBOXD_VERSION="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
+# Record the checkout path for console-driven upgrades (POST /v1/upgrade), and
+# build the tiny upgrader image (docker CLI + compose + git) that runs them.
+grep -q '^SANDBOXD_INSTALL_METHOD=' .env 2>/dev/null || printf 'SANDBOXD_INSTALL_METHOD=%s\n' "${SANDBOXD_INSTALL_METHOD:-install.sh}" >> .env
+if ! grep -q '^SANDBOXD_SRC_DIR=.' .env 2>/dev/null; then
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"; grep -vE '^SANDBOXD_SRC_DIR=' .env > "$tmp" 2>/dev/null || true
+  printf 'SANDBOXD_SRC_DIR=%s\n' "$REPO_ROOT" >> "$tmp"; mv "$tmp" .env
+fi
+$DOCKER build -q -t "sandboxd-upgrader:${SANDBOXD_VERSION}" image/upgrader >/dev/null && {
+  tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"; grep -vE '^SANDBOXD_UPGRADER_IMAGE=' .env > "$tmp" 2>/dev/null || true
+  printf 'SANDBOXD_UPGRADER_IMAGE=sandboxd-upgrader:%s\n' "$SANDBOXD_VERSION" >> "$tmp"; mv "$tmp" .env; } && ok "upgrader image: sandboxd-upgrader:${SANDBOXD_VERSION}"
 export SANDBOXD_GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
-# ── acquire images: prebuilt (fast, default) or build from source ────
-# auto: try pulling signed prebuilt images; fall back to building if they're
-# not published for this version. --pull requires them; --build always compiles.
-USE_PULL=0
-if [ "$MODE" = "pull" ]; then
-  USE_PULL=1
-elif [ "$MODE" = "auto" ]; then
-  STEP="image_pull"
-  info "looking for prebuilt images ($REGISTRY, tag $IMAGE_TAG)…"
-  if $DOCKER pull -q "$BASE_IMAGE" >/dev/null 2>&1 && $COMPOSE $PROFILE_ARGS pull -q >/dev/null 2>&1; then
-    USE_PULL=1; ok "using prebuilt images (multi-arch, cosign-signed)"
-  else
-    info "no prebuilt images for this version — building from source"
-  fi
-fi
-
-if [ "$USE_PULL" = "1" ]; then
-  if [ "$MODE" = "pull" ]; then
-    STEP="image_pull"
-    bold "Pulling prebuilt images…"
-    $DOCKER pull "$BASE_IMAGE"
-    $COMPOSE $PROFILE_ARGS pull
-    ok "images pulled"
-  fi
-else
-  STEP="base_image_build"
-  bold "Building the sandbox base image (one-time, a few minutes)…"
-  DOCKER="$DOCKER" SANDBOXD_IMAGE="$BASE_IMAGE" bash image/build.sh
-  ok "base image: $BASE_IMAGE"
-  STEP="stack_build"
-  bold "Building the control plane${CONSOLE:+ + console}…"
-  $COMPOSE $PROFILE_ARGS build
-fi
-
-STEP="compose_up"
+# Acquire all application images before starting any service.
+. "$REPO_ROOT/scripts/install-images.sh"
+acquire_images
+# Persist the selected names for later compose and upgrade invocations.
+tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"
+grep -vE '^SANDBOXD_(IMAGE|CONTROL_PLANE_IMAGE|CONSOLE_IMAGE)=' .env > "$tmp" || true
+printf 'SANDBOXD_IMAGE=%s\nSANDBOXD_CONTROL_PLANE_IMAGE=%s\nSANDBOXD_CONSOLE_IMAGE=%s\n' \
+  "$SANDBOXD_IMAGE" "$SANDBOXD_CONTROL_PLANE_IMAGE" "$SANDBOXD_CONSOLE_IMAGE" >> "$tmp"
+mv "$tmp" .env
+STAGE=stack
 bold "Starting the stack…"
-$COMPOSE $PROFILE_ARGS up -d
+# Pull the non-application proxy separately; application tags must not move
+# between signature verification and startup.
+$COMPOSE pull traefik
+$COMPOSE $PROFILE_ARGS up -d --pull never
 ok "stack is up"
 chmod +x console-login.sh 2>/dev/null || true   # so `./console-login.sh` always runs
 
 # ── summary ──────────────────────────────────────────────────────────
+STAGE=done
 API_BIND="${SANDBOXD_API_BIND:-127.0.0.1:9090}"
 HTTP_PORT="${HTTP_PORT:-80}"
 PREVIEW_DOMAIN="${PREVIEW_DOMAIN:-localhost}"
+CONSOLE_HOST="${CONSOLE_HOST:-console.${PREVIEW_DOMAIN}}"
 PORTSUFFIX=""; [ "$HTTP_PORT" != "80" ] && PORTSUFFIX=":$HTTP_PORT"
+# Preview host shape, mirroring PREVIEW_HOST_STYLE / PREVIEW_HOST_TAG.
+PREVIEW_SUFFIX=".preview.${PREVIEW_DOMAIN}"
+if [ "${PREVIEW_HOST_STYLE:-nested}" = "flat" ]; then
+  PREVIEW_SUFFIX="${PREVIEW_HOST_TAG:+--$PREVIEW_HOST_TAG}.${PREVIEW_DOMAIN}"
+fi
 
 echo
 bold "sandboxd is running 🎉"
 cat <<EOF
 
   Control-plane API : http://${API_BIND}   (auth required — use your API key)
-  Preview URLs      : http://s-<id>-<port>.preview.${PREVIEW_DOMAIN}${PORTSUFFIX}
+  Preview URLs      : http://s-<id>-<port>${PREVIEW_SUFFIX}${PORTSUFFIX}
 
   Create your first sandbox (exposing a dev server on port 3000):
 
@@ -275,7 +265,7 @@ cat <<EOF
       -H 'content-type: application/json' \\
       -d '{"id":"demo01","ports":[3000]}' | tee /dev/stderr
 
-  Then open:  http://s-demo01-3000.preview.${PREVIEW_DOMAIN}${PORTSUFFIX}
+  Then open:  http://s-demo01-3000${PREVIEW_SUFFIX}${PORTSUFFIX}
 
   Logs:   $COMPOSE logs -f sandboxd
   Stop:   $COMPOSE down
@@ -286,7 +276,7 @@ EOF
 if [ "$CONSOLE" = "1" ]; then
   echo
   bold "Web console — open this first 👇"
-  printf '\n  Open    : http://console.%s%s\n' "$PREVIEW_DOMAIN" "$PORTSUFFIX"
+  printf '\n  Open    : http://%s%s\n' "$CONSOLE_HOST" "$PORTSUFFIX"
   printf '  Login   : create your password on first visit (change it anytime in Settings)\n'
   printf '  Then connect an agent in Settings, create an app, and build.\n'
 fi
@@ -297,12 +287,14 @@ if [ -n "$API_KEY" ]; then
   printf '  Send it as:  Authorization: Bearer <key>   (rotate in .env or the console)\n'
 fi
 printf '\n  Lost these later?  run:  ./console-login.sh\n'
+printf '  Forgot the console password later?  ./console-login.sh --reset-password\n'
 printf '  Update later:      run:  ./upgrade.sh   (backs up first, auto-rollback)\n'
+printf '  Public URL:        previews on %s only work from this network / plain HTTP.\n' "$PREVIEW_DOMAIN"
+printf '                     https://you.sandboxd.io in one command: https://sandboxd.io/cloud  ·  or your own domain: https://sandboxd.io/guides/production-tls\n'
 chmod +x upgrade.sh 2>/dev/null || true
 
 # A single, plain (no-color) nudge — suppress with SANDBOXD_NO_SPONSOR=1.
-[ -z "${SANDBOXD_NO_SPONSOR:-}" ] && printf '\n  \342\230\205 sandboxd is free & MIT. If it saves you time: https://github.com/sponsors/tastyeffectco\n'
-
-# Founder support hook — the person who just watched the install succeed is at
-# peak goodwill. One honest line; suppressed alongside the sponsor nudge.
-[ -z "${SANDBOXD_NO_SPONSOR:-}" ] && printf '  Deploying this for real? I help teams get sandboxd production-ready \342\200\224 https://sandboxd.io/support\n'
+if [ -z "${SANDBOXD_NO_SPONSOR:-}" ]; then
+  printf '\n  \342\230\205 sandboxd is free & MIT. If it saves you time: https://github.com/sponsors/tastyeffectco\n'
+  printf '  Deploying this for real? Support: https://sandboxd.io/support\n'
+fi
