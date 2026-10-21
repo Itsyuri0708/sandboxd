@@ -12,9 +12,9 @@ jobs:
       run:
         working-directory: control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: control-plane/go.mod
 
@@ -37,6 +37,38 @@ jobs:
       - name: test
         run: go test ./...
 
+  agent-providers:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: control-plane/go.mod
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install the tested agent releases
+        run: |
+          npm install --prefix "$RUNNER_TEMP/agent-tools" --ignore-scripts --no-audit --no-fund opencode-ai@1.19.3 @earendil-works/pi-coding-agent@1.3.0
+          node "$RUNNER_TEMP/agent-tools/node_modules/opencode-ai/postinstall.mjs"
+          echo "$RUNNER_TEMP/agent-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Real agent tool calls through both provider protocols
+        working-directory: control-plane
+        env:
+          SANDBOXD_TEST_REAL_AGENTS: "1"
+          XDG_DATA_HOME: ${{ runner.temp }}/agent-data
+          XDG_CONFIG_HOME: ${{ runner.temp }}/agent-config
+          XDG_CACHE_HOME: ${{ runner.temp }}/agent-cache
+        run: go test ./cmd/runtimed -run TestRealProviderAgents -v -count=1 -timeout=10m
+
   # End-to-end: build the base image + sandboxd and drive the real
   # create -> seed -> install -> serve -> wake lifecycle on Docker. Also
   # smoke-tests the image (agent CLIs + default template on PATH), so a
@@ -53,9 +85,9 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: control-plane/go.mod
 
@@ -79,8 +111,8 @@ jobs:
       run:
         working-directory: console
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - name: enable pnpm
@@ -91,6 +123,10 @@ jobs:
         run: pnpm exec tsc --noEmit
       - name: unit tests
         run: pnpm test
+      - name: browser setup
+        run: pnpm exec playwright install --with-deps chromium
+      - name: builder and model connection browser tests
+        run: pnpm exec playwright test --config playwright.providers.config.ts
       - name: build
         run: pnpm build
       - name: build console image
@@ -109,7 +145,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: parse install.sh
         run: bash -n install.sh
       - name: install.sh platform logic (docker stubbed)
@@ -118,3 +154,5 @@ jobs:
         run: bash -n upgrade.sh release.sh
       - name: upgrade.sh release notes + breaking-changes prompt (curl stubbed)
         run: bash scripts/test-upgrade-notes.sh
+      - name: verified release image selection (Docker and cosign stubbed)
+        run: bash scripts/test-install-images.sh

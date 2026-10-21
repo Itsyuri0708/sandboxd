@@ -26,6 +26,17 @@ info() { printf '  \033[36m›\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 die()  { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# --build always builds locally; --pull requires verified release images.
+MODE=auto
+for arg in "$@"; do
+  case "$arg" in
+    --build) MODE=build ;;
+    --pull) MODE=pull ;;
+    --no-console) ;;
+    *) die "Unknown option: $arg (use --build, --pull, or --no-console)" ;;
+  esac
+done
+
 # ── anonymous install-failure beacon ─────────────────────────────────
 # If the installer aborts, send ONE event: {stage} + a random id — nothing
 # else (no hostname, IP, paths or output). Same opt-out as the daemon:
@@ -146,12 +157,6 @@ fi
 ( chmod 0777 "$LOG_DIR" 2>/dev/null || sudo chmod 0777 "$LOG_DIR" ) || true
 ok "data dir ready: $DATA_DIR"
 
-# ── build the sandbox base image ─────────────────────────────────────
-STAGE=base-image
-bold "Building the sandbox base image (one-time, a few minutes)…"
-DOCKER="$DOCKER" SANDBOXD_IMAGE="$BASE_IMAGE" bash image/build.sh "${BASE_IMAGE##*:}"
-ok "base image: $BASE_IMAGE"
-
 # ── API auth bootstrap key ───────────────────────────────────────────
 STAGE=api-key
 # Auth is ON by default: every /v1 call needs a console session or an API key.
@@ -215,9 +220,21 @@ $DOCKER build -q -t "sandboxd-upgrader:${SANDBOXD_VERSION}" image/upgrader >/dev
   tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"; grep -vE '^SANDBOXD_UPGRADER_IMAGE=' .env > "$tmp" 2>/dev/null || true
   printf 'SANDBOXD_UPGRADER_IMAGE=sandboxd-upgrader:%s\n' "$SANDBOXD_VERSION" >> "$tmp"; mv "$tmp" .env; } && ok "upgrader image: sandboxd-upgrader:${SANDBOXD_VERSION}"
 export SANDBOXD_GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
-bold "Building the control plane${CONSOLE:+ + console} and starting the stack…"
-$COMPOSE $PROFILE_ARGS build
-$COMPOSE $PROFILE_ARGS up -d
+# Acquire all application images before starting any service.
+. "$REPO_ROOT/scripts/install-images.sh"
+acquire_images
+# Persist the selected names for later compose and upgrade invocations.
+tmp="$(mktemp "${TMPDIR:-/tmp}/sandboxd-env.XXXXXX")"
+grep -vE '^SANDBOXD_(IMAGE|CONTROL_PLANE_IMAGE|CONSOLE_IMAGE)=' .env > "$tmp" || true
+printf 'SANDBOXD_IMAGE=%s\nSANDBOXD_CONTROL_PLANE_IMAGE=%s\nSANDBOXD_CONSOLE_IMAGE=%s\n' \
+  "$SANDBOXD_IMAGE" "$SANDBOXD_CONTROL_PLANE_IMAGE" "$SANDBOXD_CONSOLE_IMAGE" >> "$tmp"
+mv "$tmp" .env
+STAGE=stack
+bold "Starting the stack…"
+# Fetch the proxy only if missing; application tags must not move between
+# signature verification and startup.
+$COMPOSE pull --policy missing traefik
+$COMPOSE $PROFILE_ARGS up -d --pull never
 ok "stack is up"
 chmod +x console-login.sh 2>/dev/null || true   # so `./console-login.sh` always runs
 
@@ -277,4 +294,7 @@ printf '                     https://you.sandboxd.io in one command: https://san
 chmod +x upgrade.sh 2>/dev/null || true
 
 # A single, plain (no-color) nudge — suppress with SANDBOXD_NO_SPONSOR=1.
-[ -z "${SANDBOXD_NO_SPONSOR:-}" ] && printf '\n  \342\230\205 sandboxd is free & MIT. If it saves you time: https://github.com/sponsors/tastyeffectco\n'
+if [ -z "${SANDBOXD_NO_SPONSOR:-}" ]; then
+  printf '\n  \342\230\205 sandboxd is free & MIT. If it saves you time: https://github.com/sponsors/tastyeffectco\n'
+  printf '  Deploying this for real? Support: https://sandboxd.io/support\n'
+fi
